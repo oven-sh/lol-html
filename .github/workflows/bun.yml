@@ -1,0 +1,42 @@
+name: bun
+
+# Runs the crate's own test suite against the `bun` branch. Upstream's
+# `ci.yml` only triggers on `master`; this file is additive so rebasing the
+# fork onto a new upstream tag does not have to re-edit `ci.yml`.
+on:
+  push:
+    branches:
+      - bun
+  pull_request:
+    branches:
+      - bun
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          key: index-${{ hashFiles('Cargo.toml') }}
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+      - name: Fetch dependencies
+        run: cargo fetch
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          key: target-bun-${{ hashFiles('Cargo.lock') }}
+          path: target
+      - name: Run tests
+        run: cargo test --features=integration_test --target-dir=target
