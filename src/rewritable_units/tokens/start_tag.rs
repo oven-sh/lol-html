@@ -229,6 +229,20 @@ impl<'input_token> StartTag<'input_token> {
         self.mutations.mutate().remove();
     }
 
+    /// Detaches the tag from the parser's input buffer so it can outlive the
+    /// current `write()` call (handler suspension). Leaves `self` behind in a
+    /// drained state; the caller abandons it.
+    pub(crate) fn take_owned(&mut self) -> StartTag<'static> {
+        StartTag {
+            name: self.name.take_owned(),
+            attributes: self.attributes.take_owned(),
+            ns: self.ns,
+            self_closing: self.self_closing,
+            raw: self.raw.take_owned(),
+            mutations: std::mem::replace(&mut self.mutations, Mutations::new()),
+        }
+    }
+
     fn serialize_self(
         &mut self,
         sink: &mut StreamingHandlerSink<'_>,

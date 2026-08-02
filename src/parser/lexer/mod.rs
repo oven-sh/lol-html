@@ -7,12 +7,22 @@ mod lexeme;
 pub(crate) use self::lexeme::*;
 use crate::base::{Align, Bytes, Range};
 use crate::html::{LocalNameHash, Namespace, TextType};
-use crate::parser::state_machine::{ActionResult, FeedbackDirective, StateMachine, StateResult};
+use crate::parser::state_machine::{
+    ActionError, ActionResult, FeedbackDirective, StateMachine, StateResult,
+};
 use crate::parser::{ParserContext, ParserDirective, ParsingAmbiguityError, TreeBuilderFeedback};
+use crate::rewriter::RewritingError;
 
 pub(crate) trait LexemeSink {
     fn handle_tag(&mut self, lexeme: &TagLexeme<'_>) -> ActionResult<ParserDirective>;
     fn handle_non_tag_content(&mut self, lexeme: &NonTagContentLexeme<'_>) -> ActionResult;
+    /// Flushes the pending captured-text chunk: the one the text decoder
+    /// could not mark `last_in_text_node` until it knew the next lexeme
+    /// would not be text. The lexer calls this *before* it builds each
+    /// non-text lexeme, so a text handler that suspends here has no live
+    /// lexeme above it on the stack and the tag/comment/... can simply be
+    /// re-lexed from the suspension bookmark.
+    fn flush_pending_text(&mut self) -> ActionResult;
 }
 
 pub(crate) type State<S> = fn(&mut Lexer<S>, context: &mut ParserContext<S>, &[u8]) -> StateResult;
@@ -97,6 +107,40 @@ impl<S: LexemeSink> Lexer<S> {
         }
     }
 
+    /// Converts a handler suspension (`RewritingError::Suspended` escaping a
+    /// dispatch) into the lexer-level [`ActionError::Suspended`]. Captures
+    /// the bookmark needed to continue lexing at `lexeme_start` once the
+    /// parked dispatch is resumed and rebases the lexer's input-relative
+    /// state, because the unconsumed tail gets re-buffered at offset 0.
+    #[cold]
+    fn map_suspension<T>(&mut self, res: ActionResult<T>) -> ActionResult<T> {
+        match res {
+            Err(e) if matches!(*e, ActionError::RewritingError(RewritingError::Suspended)) => {
+                let consumed_byte_count = self.lexeme_start;
+                // Unconditionally: unlike `break_on_end_of_input` this runs
+                // even on the last input, because the resume always re-feeds
+                // the tail.
+                self.adjust_for_next_input();
+                let bookmark = self.create_bookmark(0, FeedbackDirective::None);
+                Err(Box::new(ActionError::Suspended {
+                    consumed_byte_count,
+                    bookmark,
+                }))
+            }
+            other => other,
+        }
+    }
+
+    /// Flush the pending captured-text chunk before a non-text lexeme is
+    /// built. At this point `lexeme_start` is still the position of that
+    /// upcoming lexeme, so a suspension here makes the resume re-lex it from
+    /// scratch (with no stale tree-builder feedback: none was applied yet).
+    #[inline]
+    fn flush_pending_text(&mut self, context: &mut ParserContext<S>) -> ActionResult {
+        let res = context.output_sink.flush_pending_text();
+        self.map_suspension(res)
+    }
+
     #[inline]
     fn emit_lexeme(
         &mut self,
@@ -107,8 +151,8 @@ impl<S: LexemeSink> Lexer<S> {
 
         self.lexeme_start = lexeme.raw_range().end;
 
-        context.output_sink.handle_non_tag_content(lexeme)?;
-        Ok(())
+        let res = context.output_sink.handle_non_tag_content(lexeme);
+        self.map_suspension(res)
     }
 
     #[inline]
@@ -121,7 +165,8 @@ impl<S: LexemeSink> Lexer<S> {
 
         self.lexeme_start = lexeme.raw_range().end;
 
-        context.output_sink.handle_tag(lexeme)
+        let res = context.output_sink.handle_tag(lexeme);
+        self.map_suspension(res)
     }
 
     #[inline]

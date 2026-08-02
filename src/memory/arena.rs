@@ -6,6 +6,9 @@ use super::{MemoryLimitExceededError, SharedMemoryLimiter};
 pub(crate) struct Arena {
     limiter: SharedMemoryLimiter,
     data: Vec<u8>,
+    /// Offset of the live region within `data`. `shift` only advances this;
+    /// the dead prefix is reclaimed lazily by the next `append`.
+    start: usize,
 }
 
 impl Arena {
@@ -23,10 +26,28 @@ impl Arena {
             "Total preallocated memory size should be less than `MemorySettings::max_allowed_memory_usage`."
         );
 
-        Self { limiter, data }
+        Self {
+            limiter,
+            data,
+            start: 0,
+        }
+    }
+
+    /// Reclaim the dead prefix left behind by `shift`, in one memmove.
+    fn compact(&mut self) {
+        if self.start > 0 {
+            self.data.copy_within(self.start.., 0);
+            let live = self.data.len() - self.start;
+            self.data.truncate(live);
+            self.start = 0;
+        }
     }
 
     pub fn append(&mut self, slice: &[u8]) -> Result<(), MemoryLimitExceededError> {
+        // Only the multi-write streaming path appends after a `shift`, and it
+        // is the only place the dead prefix has to go away.
+        self.compact();
+
         // this specific form of capacity check optimizes out redundant resizing in extend_from_slice
         if self.data.capacity() - self.data.len() < slice.len() {
             let additional = slice.len() + self.data.len() - self.data.capacity();
@@ -51,16 +72,20 @@ impl Arena {
 
     pub fn init_with(&mut self, slice: &[u8]) -> Result<(), MemoryLimitExceededError> {
         self.data.clear();
+        self.start = 0;
         self.append(slice)
     }
 
+    /// O(1): advances the live-region start instead of memmoving the tail.
+    /// A suspended rewrite resumes by re-feeding the unconsumed tail, so this
+    /// runs once per suspension — memmoving there is O(suspensions × tail).
     pub fn shift(&mut self, byte_count: usize) {
-        self.data.copy_within(byte_count.., 0);
-        self.data.truncate(self.data.len() - byte_count);
+        debug_assert!(byte_count <= self.data.len() - self.start);
+        self.start += byte_count;
     }
 
     pub fn bytes(&self) -> &[u8] {
-        &self.data
+        &self.data[self.start..]
     }
 }
 
@@ -139,5 +164,24 @@ mod tests {
         arena.shift(1);
         assert_eq!(arena.bytes(), &[2, 3, 4, 5]);
         assert_eq!(limiter.current_usage(), 5);
+    }
+
+    // A suspended rewrite shifts once per resume with no append in between;
+    // the dead prefix must accumulate and then be reclaimed by the next append.
+    #[test]
+    fn consecutive_shifts_without_append() {
+        let limiter = SharedMemoryLimiter::new(10);
+        let mut arena = Arena::new(limiter.clone(), 0);
+
+        arena.append(&[0, 1, 2, 3, 4]).unwrap();
+        arena.shift(1);
+        arena.shift(2);
+        assert_eq!(arena.bytes(), &[3, 4]);
+
+        arena.shift(2);
+        assert!(arena.bytes().is_empty());
+
+        arena.append(&[9]).unwrap();
+        assert_eq!(arena.bytes(), &[9]);
     }
 }

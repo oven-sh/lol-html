@@ -44,7 +44,7 @@ pub use self::rewriter::{
     AsciiCompatibleEncoding, BailOutHandler, CommentHandler, DoctypeHandler,
     DocumentContentHandlers, ElementContentHandlers, ElementHandler, EndHandler, EndTagHandler,
     HandlerResult, HandlerTypes, HtmlRewriter, LocalHandlerTypes, MemorySettings,
-    RewriteStrSettings, Settings, TextHandler, rewrite_str,
+    RewriteStrSettings, Settings, SuspensionRequest, TextHandler, rewrite_str,
 };
 pub use self::selectors_vm::Selector;
 pub use self::transform_stream::OutputSink;
@@ -89,7 +89,7 @@ pub mod errors {
     pub use super::rewritable_units::{
         AttributeNameError, CommentTextError, TagNameError, Utf8Error,
     };
-    pub use super::rewriter::RewritingError;
+    pub use super::rewriter::{RewritingError, SuspensionRequest};
     pub use super::selectors_vm::SelectorError;
 }
 

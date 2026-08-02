@@ -51,7 +51,19 @@ pub(crate) struct StateMachineBookmark {
 pub(crate) enum ActionError {
     RewritingError(RewritingError),
     ParserDirectiveChangeRequired(ParserDirective, StateMachineBookmark),
-    EndOfInput { consumed_byte_count: usize },
+    EndOfInput {
+        consumed_byte_count: usize,
+    },
+    /// A content handler requested suspension (see
+    /// [`crate::SuspensionRequest`]). The first `consumed_byte_count` bytes
+    /// of the current input are fully processed; the rest must be buffered
+    /// and re-fed on resume. `bookmark` (with `pos` relative to that re-fed
+    /// tail, always `0`) restores the state machine once the parked dispatch
+    /// completes.
+    Suspended {
+        consumed_byte_count: usize,
+        bookmark: StateMachineBookmark,
+    },
     Internal(&'static str),
 }
 
