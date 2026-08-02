@@ -39,7 +39,7 @@ pub enum AttributeNameError {
 pub struct Attribute<'i> {
     name: BytesCow<'i>,
     value: BytesCow<'i>,
-    raw: Option<Bytes<'i>>,
+    raw: Option<BytesCow<'i>>,
     encoding: &'static Encoding,
 }
 
@@ -49,7 +49,7 @@ impl<'i> Attribute<'i> {
     const fn new(
         name: BytesCow<'i>,
         value: BytesCow<'i>,
-        raw: Bytes<'i>,
+        raw: BytesCow<'i>,
         encoding: &'static Encoding,
     ) -> Self {
         Attribute {
@@ -57,6 +57,16 @@ impl<'i> Attribute<'i> {
             value,
             raw: Some(raw),
             encoding,
+        }
+    }
+
+    /// Detaches the attribute from the input buffer it may borrow.
+    fn into_owned(self) -> Attribute<'static> {
+        Attribute {
+            name: self.name.into_owned(),
+            value: self.value.into_owned(),
+            raw: self.raw.map(BytesCow::into_owned),
+            encoding: self.encoding,
         }
     }
 
@@ -242,7 +252,8 @@ impl<'i> Attributes<'i> {
                         .into(),
                     self.input
                         .opt_slice(Some(a.raw_range))
-                        .unwrap_or_else(cant_fail),
+                        .unwrap_or_else(cant_fail)
+                        .into(),
                     self.encoding,
                 )
             })
@@ -264,11 +275,44 @@ impl<'i> Attributes<'i> {
         self.items.get_mut().unwrap_or_else(|| unreachable!())
     }
 
+    /// Detaches the collection from the lexeme's input buffer, leaving an
+    /// empty collection behind. The lazy `items` vec is forced *while the
+    /// backing lexeme is still alive* and every attribute is deep-copied, so
+    /// the result owns all of its bytes.
+    pub(crate) fn take_owned(&mut self) -> Attributes<'static> {
+        // Ensure `items` is materialized from `input`/`attribute_buffer`
+        // before those references go away.
+        let _ = self.as_mut_vec();
+        let items: Vec<Attribute<'static>> = self
+            .items
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .map(Attribute::into_owned)
+            .collect();
+
+        let cell = OnceCell::new();
+        let _ = cell.set(items);
+
+        Attributes {
+            input: &EMPTY_INPUT,
+            attribute_buffer: &EMPTY_ATTRIBUTE_BUFFER,
+            items: cell,
+            encoding: self.encoding,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) const fn raw_attributes(&self) -> (&'i Bytes<'i>, &'i AttributeBuffer) {
         (self.input, self.attribute_buffer)
     }
 }
+
+// Placeholder backing for an owned `Attributes`. Once `take_owned` has
+// materialized `items`, `input`/`attribute_buffer` are never read again
+// (`is_empty` and `as_mut_vec` both short-circuit on an initialized cell).
+static EMPTY_INPUT: Bytes<'static> = Bytes::new(&[]);
+static EMPTY_ATTRIBUTE_BUFFER: AttributeBuffer = Vec::new();
 
 impl Serialize for &mut Attributes<'_> {
     #[inline]

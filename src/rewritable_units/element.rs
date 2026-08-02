@@ -37,18 +37,26 @@ pub enum TagNameError {
     UnencodableCharacter,
 }
 
+/// Either a borrow of the `StartTag` living in the dispatcher's stack-local
+/// [`Token`], or — once the element has been detached by a handler suspension
+/// — an owned, heap-allocated copy of it.
+enum StartTagRef<'rewriter, 'input_token> {
+    Borrowed(&'rewriter mut StartTag<'input_token>),
+    Owned(Box<StartTag<'input_token>>),
+}
+
 /// An HTML element rewritable unit.
 ///
 /// Exposes API for examination and modification of a parsed HTML element.
 pub struct Element<'rewriter, 'input_token, H: HandlerTypes = LocalHandlerTypes> {
-    start_tag: &'rewriter mut StartTag<'input_token>,
+    start_tag: StartTagRef<'rewriter, 'input_token>,
     end_tag_mutations: Option<Mutations>,
     modified_end_tag_name: Option<Box<[u8]>>,
     end_tag_handlers: Vec<H::EndTagHandler<'static>>,
     can_have_content: bool,
     should_remove_content: bool,
     encoding: &'static Encoding,
-    user_data: Box<dyn Any>,
+    user_data: Box<dyn Any + Send>,
 }
 
 impl<'rewriter, 'input_token, H: HandlerTypes> Element<'rewriter, 'input_token, H> {
@@ -61,7 +69,7 @@ impl<'rewriter, 'input_token, H: HandlerTypes> Element<'rewriter, 'input_token, 
         let encoding = start_tag.encoding();
 
         Element {
-            start_tag,
+            start_tag: StartTagRef::Borrowed(start_tag),
             end_tag_mutations: None,
             modified_end_tag_name: None,
             end_tag_handlers: Vec::new(),
@@ -69,6 +77,44 @@ impl<'rewriter, 'input_token, H: HandlerTypes> Element<'rewriter, 'input_token, 
             should_remove_content: false,
             encoding,
             user_data: Box::new(()),
+        }
+    }
+
+    #[inline]
+    fn tag(&self) -> &StartTag<'input_token> {
+        match &self.start_tag {
+            StartTagRef::Borrowed(t) => t,
+            StartTagRef::Owned(t) => t,
+        }
+    }
+
+    #[inline]
+    fn tag_mut(&mut self) -> &mut StartTag<'input_token> {
+        match &mut self.start_tag {
+            StartTagRef::Borrowed(t) => t,
+            StartTagRef::Owned(t) => t,
+        }
+    }
+
+    /// Detaches the element from the parser's stack-local [`Token`] so it can
+    /// outlive the current `write()` call (handler suspension). The start tag
+    /// (and every byte slice it borrows from the input buffer) is deep-copied
+    /// onto the heap.
+    pub(crate) fn into_suspended(self) -> Element<'static, 'static, H> {
+        let start_tag = Box::new(match self.start_tag {
+            StartTagRef::Borrowed(t) => t.take_owned(),
+            StartTagRef::Owned(mut t) => t.take_owned(),
+        });
+
+        Element {
+            start_tag: StartTagRef::Owned(start_tag),
+            end_tag_mutations: self.end_tag_mutations,
+            modified_end_tag_name: self.modified_end_tag_name,
+            end_tag_handlers: self.end_tag_handlers,
+            can_have_content: self.can_have_content,
+            should_remove_content: self.should_remove_content,
+            encoding: self.encoding,
+            user_data: self.user_data,
         }
     }
 
@@ -98,7 +144,7 @@ impl<'rewriter, 'input_token, H: HandlerTypes> Element<'rewriter, 'input_token, 
 
     #[inline]
     fn remove_content(&mut self) {
-        self.start_tag.mutations.mutate().content_after.clear();
+        self.tag_mut().mutations.mutate().content_after.clear();
         if let Some(end) = self.end_tag_mutations.as_mut().and_then(|m| m.if_mutated()) {
             end.content_before.clear();
         }
@@ -116,14 +162,14 @@ impl<'rewriter, 'input_token, H: HandlerTypes> Element<'rewriter, 'input_token, 
     #[inline]
     #[must_use]
     pub fn tag_name(&self) -> String {
-        self.start_tag.name()
+        self.tag().name()
     }
 
     /// Returns the tag name of the element, preserving its case.
     #[inline]
     #[must_use]
     pub fn tag_name_preserve_case(&self) -> String {
-        self.start_tag.name_preserve_case()
+        self.tag().name_preserve_case()
     }
 
     /// Sets the tag name of the element.
@@ -139,7 +185,7 @@ impl<'rewriter, 'input_token, H: HandlerTypes> Element<'rewriter, 'input_token, 
             self.modified_end_tag_name = Some((*name).into());
         }
 
-        self.start_tag.set_name_raw(name);
+        self.tag_mut().set_name_raw(name);
 
         Ok(())
     }
@@ -158,7 +204,7 @@ impl<'rewriter, 'input_token, H: HandlerTypes> Element<'rewriter, 'input_token, 
     #[inline]
     #[must_use]
     pub fn is_self_closing(&self) -> bool {
-        self.start_tag.self_closing()
+        self.tag().self_closing()
     }
 
     /// Whether the element can have inner content.
@@ -181,14 +227,14 @@ impl<'rewriter, 'input_token, H: HandlerTypes> Element<'rewriter, 'input_token, 
     #[inline]
     #[must_use]
     pub fn namespace_uri(&self) -> &'static str {
-        self.start_tag.namespace_uri()
+        self.tag().namespace_uri()
     }
 
     /// Returns an immutable collection of element's attributes.
     #[inline]
     #[must_use]
     pub fn attributes(&self) -> &[Attribute<'input_token>] {
-        self.start_tag.attributes()
+        self.tag().attributes()
     }
 
     /// Returns the value of an attribute with the `name`. The value may have HTML/XML entities.
@@ -225,13 +271,13 @@ impl<'rewriter, 'input_token, H: HandlerTypes> Element<'rewriter, 'input_token, 
     /// to the element with `name` and `value`.
     #[inline]
     pub fn set_attribute(&mut self, name: &str, value: &str) -> Result<(), AttributeNameError> {
-        self.start_tag.set_attribute(name, value)
+        self.tag_mut().set_attribute(name, value)
     }
 
     /// Removes an attribute with the `name` if it is present.
     #[inline]
     pub fn remove_attribute(&mut self, name: &str) {
-        self.start_tag.remove_attribute(name);
+        self.tag_mut().remove_attribute(name);
     }
 
     /// Inserts `content` before the element.
@@ -264,7 +310,7 @@ impl<'rewriter, 'input_token, H: HandlerTypes> Element<'rewriter, 'input_token, 
     /// ```
     #[inline]
     pub fn before(&mut self, content: &str, content_type: ContentType) {
-        self.start_tag
+        self.tag_mut()
             .mutations
             .mutate()
             .content_before
@@ -277,7 +323,7 @@ impl<'rewriter, 'input_token, H: HandlerTypes> Element<'rewriter, 'input_token, 
     ///
     /// Use the [`streaming!`] macro to make a `StreamingHandler` from a closure.
     pub fn streaming_before(&mut self, string_writer: Box<dyn StreamingHandler + Send + 'static>) {
-        self.start_tag
+        self.tag_mut()
             .mutations
             .mutate()
             .content_before
@@ -321,7 +367,7 @@ impl<'rewriter, 'input_token, H: HandlerTypes> Element<'rewriter, 'input_token, 
         if self.can_have_content {
             &mut self.end_tag_mutations_mut().content_after
         } else {
-            &mut self.start_tag.mutations.mutate().content_after
+            &mut self.tag_mut().mutations.mutate().content_after
         }
         .push_front(chunk);
     }
@@ -378,12 +424,9 @@ impl<'rewriter, 'input_token, H: HandlerTypes> Element<'rewriter, 'input_token, 
 
     fn prepend_chunk(&mut self, chunk: StringChunk) {
         if self.can_have_content {
-            self.start_tag.set_self_closing_syntax(false);
-            self.start_tag
-                .mutations
-                .mutate()
-                .content_after
-                .push_front(chunk);
+            let tag = self.tag_mut();
+            tag.set_self_closing_syntax(false);
+            tag.mutations.mutate().content_after.push_front(chunk);
         }
     }
 
@@ -443,7 +486,7 @@ impl<'rewriter, 'input_token, H: HandlerTypes> Element<'rewriter, 'input_token, 
 
     fn append_chunk(&mut self, chunk: StringChunk) {
         if self.can_have_content {
-            self.start_tag.set_self_closing_syntax(false);
+            self.tag_mut().set_self_closing_syntax(false);
             self.end_tag_mutations_mut().content_before.push_back(chunk);
         }
     }
@@ -502,9 +545,9 @@ impl<'rewriter, 'input_token, H: HandlerTypes> Element<'rewriter, 'input_token, 
 
     fn set_inner_content_chunk(&mut self, chunk: StringChunk) {
         if self.can_have_content {
-            self.start_tag.set_self_closing_syntax(false);
+            self.tag_mut().set_self_closing_syntax(false);
             self.remove_content();
-            self.start_tag
+            self.tag_mut()
                 .mutations
                 .mutate()
                 .content_after
@@ -561,7 +604,7 @@ impl<'rewriter, 'input_token, H: HandlerTypes> Element<'rewriter, 'input_token, 
     }
 
     fn replace_chunk(&mut self, chunk: StringChunk) {
-        self.start_tag.mutations.mutate().replace(chunk);
+        self.tag_mut().mutations.mutate().replace(chunk);
 
         if self.can_have_content {
             self.remove_content();
@@ -582,7 +625,7 @@ impl<'rewriter, 'input_token, H: HandlerTypes> Element<'rewriter, 'input_token, 
     /// Removes the element and its inner content.
     #[inline]
     pub fn remove(&mut self) {
-        self.start_tag.mutations.mutate().remove();
+        self.tag_mut().mutations.mutate().remove();
 
         if self.can_have_content {
             self.remove_content();
@@ -615,7 +658,7 @@ impl<'rewriter, 'input_token, H: HandlerTypes> Element<'rewriter, 'input_token, 
     /// ```
     #[inline]
     pub fn remove_and_keep_content(&mut self) {
-        self.start_tag.remove();
+        self.tag_mut().remove();
 
         if self.can_have_content {
             self.end_tag_mutations_mut().remove();
@@ -626,7 +669,7 @@ impl<'rewriter, 'input_token, H: HandlerTypes> Element<'rewriter, 'input_token, 
     #[inline]
     #[must_use]
     pub fn removed(&self) -> bool {
-        self.start_tag.mutations.removed()
+        self.tag().mutations.removed()
     }
 
     #[inline]
@@ -637,7 +680,7 @@ impl<'rewriter, 'input_token, H: HandlerTypes> Element<'rewriter, 'input_token, 
     /// Returns the start tag.
     #[inline]
     pub fn start_tag(&mut self) -> &mut StartTag<'input_token> {
-        self.start_tag
+        self.tag_mut()
     }
 
     /// Returns the handlers that will run when the end tag is reached.
@@ -701,10 +744,18 @@ impl<'rewriter, 'input_token, H: HandlerTypes> Element<'rewriter, 'input_token, 
     }
 
     pub(crate) fn into_end_tag_handler(self) -> Option<H::EndTagHandler<'static>> {
-        let end_tag_mutations = self.end_tag_mutations;
-        let modified_end_tag_name = self.modified_end_tag_name;
-        let mut end_tag_handlers = self.end_tag_handlers;
+        Self::make_end_tag_handler(
+            self.end_tag_mutations,
+            self.modified_end_tag_name,
+            self.end_tag_handlers,
+        )
+    }
 
+    fn make_end_tag_handler(
+        end_tag_mutations: Option<Mutations>,
+        modified_end_tag_name: Option<Box<[u8]>>,
+        mut end_tag_handlers: Vec<H::EndTagHandler<'static>>,
+    ) -> Option<H::EndTagHandler<'static>> {
         if end_tag_mutations.is_some()
             || modified_end_tag_name.is_some()
             || !end_tag_handlers.is_empty()
@@ -730,19 +781,41 @@ impl<'rewriter, 'input_token, H: HandlerTypes> Element<'rewriter, 'input_token, 
         }
     }
 
+    /// Splits a suspended (owned) element back into the start tag it captured
+    /// plus the bookkeeping `ContentHandlersDispatcher::handle_start_tag`
+    /// applies after the handlers run. Only valid once `into_suspended` has
+    /// detached the element.
+    pub(crate) fn into_owned_parts(
+        self,
+    ) -> (
+        Box<StartTag<'input_token>>,
+        bool,
+        Option<H::EndTagHandler<'static>>,
+    ) {
+        let StartTagRef::Owned(start_tag) = self.start_tag else {
+            unreachable!("into_owned_parts called on an element that still borrows its start tag");
+        };
+        let handler = Self::make_end_tag_handler(
+            self.end_tag_mutations,
+            self.modified_end_tag_name,
+            self.end_tag_handlers,
+        );
+        (start_tag, self.should_remove_content, handler)
+    }
+
     /// Position of this element's start tag in the source document, before any rewriting
     ///
     /// The end of this element hasn't been parsed yet. To find it, use [`Element::end_tag_handlers`].
     #[must_use]
     pub fn source_location(&self) -> SourceLocation {
-        self.start_tag.source_location()
+        self.tag().source_location()
     }
 
     /// [Self::namespace_uri], but as a `CStr`
     #[inline]
     #[must_use]
     pub fn namespace_uri_c_str(&self) -> &'static std::ffi::CStr {
-        self.start_tag.namespace_uri_c_str()
+        self.tag().namespace_uri_c_str()
     }
 }
 

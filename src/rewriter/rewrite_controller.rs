@@ -1,5 +1,5 @@
 use super::handlers_dispatcher::{ContentHandlersDispatcher, SelectorHandlersLocator};
-use super::{HandlerTypes, RewritingError, Settings};
+use super::{HandlerTypes, RewritingError, Settings, content_handler_error};
 use crate::base::SharedEncoding;
 use crate::html::{LocalName, Namespace};
 use crate::memory::SharedMemoryLimiter;
@@ -8,6 +8,8 @@ use crate::selectors_vm::Ast;
 use crate::selectors_vm::{AuxStartTagInfoRequest, ElementData, SelectorMatchingVm, VmError};
 use crate::transform_stream::{DispatcherError, StartTagHandlingResult, TransformController};
 use hashbrown::{DefaultHashBuilder, HashSet};
+
+pub(crate) use super::handlers_dispatcher::SuspendedToken;
 
 pub(crate) struct ElementDescriptor {
     pub matched_content_handlers: HashSet<SelectorHandlersLocator>,
@@ -123,6 +125,12 @@ impl<H: HandlerTypes> HtmlRewriteController<'_, H> {
     fn get_capture_flags(&self) -> TokenCaptureFlags {
         self.handlers_dispatcher.get_token_capture_flags()
     }
+
+    /// The rewritable unit a handler is currently suspended on, if any.
+    #[inline]
+    pub(crate) fn suspended_token_mut(&mut self) -> Option<&mut SuspendedToken<H>> {
+        self.handlers_dispatcher.suspended_token_mut()
+    }
 }
 
 impl<H: HandlerTypes> TransformController for HtmlRewriteController<'_, H> {
@@ -173,13 +181,30 @@ impl<H: HandlerTypes> TransformController for HtmlRewriteController<'_, H> {
 
         self.handlers_dispatcher
             .handle_token(token, current_element_data)
-            .map_err(RewritingError::ContentHandlerError)
+            .map_err(content_handler_error)
     }
 
     fn handle_end(&mut self, document_end: &mut DocumentEnd<'_>) -> Result<(), RewritingError> {
         self.handlers_dispatcher
             .handle_end(document_end)
-            .map_err(RewritingError::ContentHandlerError)
+            .map_err(content_handler_error)
+    }
+
+    fn resume_suspended_token(&mut self) -> Result<Token<'static>, RewritingError> {
+        let current_element_data = self
+            .selector_matching_vm
+            .as_mut()
+            .and_then(SelectorMatchingVm::current_element_data_mut);
+
+        self.handlers_dispatcher
+            .resume_suspended_token(current_element_data)
+            .map_err(content_handler_error)
+    }
+
+    fn resume_suspended_document_end(&mut self) -> Result<DocumentEnd<'static>, RewritingError> {
+        self.handlers_dispatcher
+            .resume_suspended_document_end()
+            .map_err(content_handler_error)
     }
 
     #[inline]

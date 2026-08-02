@@ -23,6 +23,19 @@ where
     pub strict: bool,
 }
 
+/// Which stage of the rewrite a content handler suspended, if any.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum SuspendedPhase {
+    /// Not suspended.
+    None,
+    /// `write()`'s parse suspended.
+    Write,
+    /// `end()`'s (final) parse suspended.
+    EndParse,
+    /// `end()`'s parse completed but a document-end handler suspended.
+    Finish,
+}
+
 // Pub only for integration tests
 pub struct TransformStream<C, O>
 where
@@ -32,6 +45,7 @@ where
     parser: Parser<Dispatcher<C, O>>,
     buffer: Arena,
     has_buffered_data: bool,
+    suspended: SuspendedPhase,
 }
 
 impl<C, O> TransformStream<C, O>
@@ -67,11 +81,13 @@ where
             parser,
             buffer,
             has_buffered_data: false,
+            suspended: SuspendedPhase::None,
         }
     }
 
     pub fn write(&mut self, data: &[u8]) -> Result<(), RewritingError> {
         trace!(@write data);
+        debug_assert!(self.suspended == SuspendedPhase::None);
 
         let chunk = if self.has_buffered_data {
             self.buffer
@@ -107,11 +123,20 @@ where
             self.has_buffered_data = false;
         }
 
+        // NOTE: a suspension reports `consumed_byte_count` exactly like an
+        // end-of-input, so the tail bookkeeping above already saved the
+        // unconsumed rest of the chunk for `resume`.
+        if self.parser.is_suspended() {
+            self.suspended = SuspendedPhase::Write;
+            return Err(RewritingError::Suspended);
+        }
+
         Ok(())
     }
 
     pub fn end(&mut self) -> Result<(), RewritingError> {
         trace!(@end);
+        debug_assert!(self.suspended == SuspendedPhase::None);
 
         let chunk = if self.has_buffered_data {
             self.buffer.bytes()
@@ -121,8 +146,123 @@ where
 
         trace!(@chunk chunk);
 
-        self.parser.parse(chunk, true)?;
-        self.parser.get_dispatcher().finish(chunk)
+        let total = chunk.len();
+        let consumed_byte_count = self.parser.parse(chunk, true)?;
+
+        if self.parser.is_suspended() {
+            // `finish` (which flushes the raw tail) won't run; emit the
+            // consumed part now and keep the rest for `resume`.
+            self.parser
+                .get_dispatcher()
+                .flush_remaining_input(chunk, consumed_byte_count);
+
+            if consumed_byte_count < total {
+                self.buffer.shift(consumed_byte_count);
+            } else {
+                self.has_buffered_data = false;
+            }
+
+            self.suspended = SuspendedPhase::EndParse;
+            return Err(RewritingError::Suspended);
+        }
+
+        match self.parser.get_dispatcher().finish(chunk) {
+            Err(RewritingError::Suspended) => {
+                self.suspended = SuspendedPhase::Finish;
+                Err(RewritingError::Suspended)
+            }
+            res => res,
+        }
+    }
+
+    /// `true` if a content handler suspended the last `write()`/`end()`/
+    /// `resume()` call.
+    pub const fn is_suspended(&self) -> bool {
+        !matches!(self.suspended, SuspendedPhase::None)
+    }
+
+    /// Continues a rewrite that a content handler suspended.
+    ///
+    /// Returns `Err(RewritingError::Suspended)` again if another handler
+    /// suspends. If the suspension happened during `write()`, the caller
+    /// still has to call `end()` once this returns `Ok`.
+    pub fn resume(&mut self) -> Result<(), RewritingError> {
+        match self.suspended {
+            SuspendedPhase::None => {
+                debug_assert!(false, "TransformStream::resume without a suspension");
+                Ok(())
+            }
+            SuspendedPhase::Write | SuspendedPhase::EndParse => {
+                let last = self.suspended == SuspendedPhase::EndParse;
+
+                // 1. Complete the parked dispatch. If another handler
+                //    suspends here, the parser bookmark and the buffered
+                //    tail are untouched; the phase stays as-is.
+                let directive = self.parser.get_dispatcher().resume_dispatch()?;
+
+                // 2. Continue the parse over the tail that was buffered at
+                //    suspension time (positions in the bookmark are
+                //    relative to it).
+                let chunk: &[u8] = if self.has_buffered_data {
+                    self.buffer.bytes()
+                } else {
+                    &[]
+                };
+
+                trace!(@chunk chunk);
+
+                let total = chunk.len();
+                let consumed_byte_count = self.parser.resume(chunk, last, directive)?;
+
+                self.parser
+                    .get_dispatcher()
+                    .flush_remaining_input(chunk, consumed_byte_count);
+
+                if consumed_byte_count < total {
+                    self.buffer.shift(consumed_byte_count);
+                } else {
+                    self.has_buffered_data = false;
+                }
+
+                if self.parser.is_suspended() {
+                    return Err(RewritingError::Suspended);
+                }
+
+                self.suspended = SuspendedPhase::None;
+
+                if !last {
+                    return Ok(());
+                }
+
+                // The final parse is done; run the document-end handlers.
+                let chunk: &[u8] = if self.has_buffered_data {
+                    self.buffer.bytes()
+                } else {
+                    &[]
+                };
+
+                match self.parser.get_dispatcher().finish(chunk) {
+                    Err(RewritingError::Suspended) => {
+                        self.suspended = SuspendedPhase::Finish;
+                        Err(RewritingError::Suspended)
+                    }
+                    res => res,
+                }
+            }
+            SuspendedPhase::Finish => match self.parser.get_dispatcher().resume_finish() {
+                Err(RewritingError::Suspended) => Err(RewritingError::Suspended),
+                res => {
+                    self.suspended = SuspendedPhase::None;
+                    res
+                }
+            },
+        }
+    }
+
+    /// The transform controller, for reaching the parked token of a
+    /// suspension from the embedder.
+    pub(crate) fn controller_mut(&mut self) -> &mut C {
+        self.parser.get_dispatcher().transform_controller_mut()
     }
 
     #[cfg(feature = "integration_test")]

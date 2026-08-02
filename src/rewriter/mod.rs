@@ -4,12 +4,13 @@ mod rewrite_controller;
 #[macro_use]
 pub(crate) mod settings;
 
+use self::handlers_dispatcher::SuspendedToken;
 use self::rewrite_controller::{ElementDescriptor, HtmlRewriteController};
 pub use self::settings::*;
 use crate::base::SharedEncoding;
 use crate::memory::{MemoryLimitExceededError, SharedMemoryLimiter};
 use crate::parser::ParsingAmbiguityError;
-use crate::rewritable_units::Element;
+use crate::rewritable_units::{Comment, Doctype, DocumentEnd, Element, EndTag, TextChunk};
 use crate::transform_stream::*;
 use encoding_rs::Encoding;
 use mime::Mime;
@@ -58,11 +59,30 @@ impl TryFrom<&'static Encoding> for AsciiCompatibleEncoding {
     }
 }
 
+/// Returned from a content handler (as `Err(Box::new(SuspensionRequest))`) to
+/// make the rewriter park the current rewritable unit and exit `write()`/
+/// `end()` with [`RewritingError::Suspended`] instead of running the rest of
+/// the handlers for it.
+///
+/// Unlike every other handler error, a suspension does **not** poison the
+/// rewriter. The parked unit stays alive (reachable through the
+/// `HtmlRewriter::suspended_*` accessors) until [`HtmlRewriter::resume`] is
+/// called, which runs the remaining handlers for it and continues the
+/// document.
+///
+/// This is the hook an embedder with asynchronous content handlers uses to
+/// get out of `write()` without nesting an event loop inside it: park, return
+/// to the real event loop, and `resume()` once the handler's pending work has
+/// settled.
+#[derive(Error, Debug)]
+#[error("the content handler requested suspension")]
+pub struct SuspensionRequest;
+
 /// A compound error type that can be returned by [`write`] and [`end`] methods of the rewriter.
 ///
 /// # Note
-/// This error is unrecoverable. The rewriter instance will panic on attempt to use it after such an
-/// error.
+/// This error is unrecoverable (except for [`Suspended`](Self::Suspended)).
+/// The rewriter instance will panic on attempt to use it after such an error.
 ///
 /// [`write`]: ../struct.HtmlRewriter.html#method.write
 /// [`end`]: ../struct.HtmlRewriter.html#method.end
@@ -83,6 +103,33 @@ pub enum RewritingError {
     /// An error that was propagated from one of the content handlers.
     #[error("{0}")]
     ContentHandlerError(Box<dyn StdError + Send + Sync + 'static>),
+
+    /// A content handler returned [`SuspensionRequest`]. The rewriter parked
+    /// its state and returned early; it is **not** poisoned. Call
+    /// [`HtmlRewriter::resume`] to continue.
+    #[error("the rewriter is suspended on a content handler")]
+    Suspended,
+}
+
+/// Maps a content handler's error onto [`RewritingError`], turning the
+/// [`SuspensionRequest`] sentinel into [`RewritingError::Suspended`] so the
+/// rest of the pipeline can match on the variant instead of downcasting.
+#[inline]
+pub(crate) fn content_handler_error(
+    e: Box<dyn StdError + Send + Sync + 'static>,
+) -> RewritingError {
+    if e.is::<SuspensionRequest>() {
+        RewritingError::Suspended
+    } else {
+        RewritingError::ContentHandlerError(e)
+    }
+}
+
+/// `true` for the [`SuspensionRequest`] sentinel a content handler returns to
+/// suspend the rewriter.
+#[inline]
+pub(crate) fn is_suspension_request(e: &(dyn StdError + Send + Sync + 'static)) -> bool {
+    e.is::<SuspensionRequest>()
 }
 
 /// A streaming HTML rewriter.
@@ -139,8 +186,12 @@ macro_rules! guarded {
 
         let res = $expr;
 
-        if res.is_err() {
-            $self.poisoned = true;
+        // `Suspended` is the one non-fatal escape: the rewriter parked its
+        // state and expects `resume()` to be called.
+        if let Err(e) = &res {
+            if !matches!(e, RewritingError::Suspended) {
+                $self.poisoned = true;
+            }
         }
 
         res
@@ -210,7 +261,86 @@ impl<'h, O: OutputSink, H: HandlerTypes> HtmlRewriter<'h, O, H> {
     /// [`write`]: struct.HtmlRewriter.html#method.write
     #[inline]
     pub fn end(mut self) -> Result<(), RewritingError> {
+        self.end_mut()
+    }
+
+    /// Same as [`end`](Self::end), but keeps the rewriter alive. Required
+    /// when content handlers can suspend: the rewriter must survive an
+    /// `Err(RewritingError::Suspended)` so [`resume`](Self::resume) can be
+    /// called on it. No further `write` may follow.
+    #[inline]
+    pub fn end_mut(&mut self) -> Result<(), RewritingError> {
         guarded!(self, self.stream.end())
+    }
+
+    /// `true` if a content handler returned [`SuspensionRequest`] during the
+    /// last `write()`/`end_mut()`/`resume()` call and the rewriter is
+    /// waiting for [`resume`](Self::resume).
+    #[inline]
+    pub fn is_suspended(&self) -> bool {
+        self.stream.is_suspended()
+    }
+
+    /// Continues a rewrite that a content handler suspended (see
+    /// [`SuspensionRequest`]): runs the remaining handlers for the parked
+    /// rewritable unit, serializes it, and keeps going until the suspended
+    /// operation (`write` or `end_mut`) completes or another handler
+    /// suspends.
+    ///
+    /// If the suspension happened during `write()`, the caller still has to
+    /// call [`end_mut`](Self::end_mut) once this returns `Ok`.
+    #[inline]
+    pub fn resume(&mut self) -> Result<(), RewritingError> {
+        guarded!(self, self.stream.resume())
+    }
+
+    /// The [`Element`] a handler is suspended on, if any. Its address is
+    /// stable until the element's handlers all complete.
+    pub fn suspended_element(&mut self) -> Option<&mut Element<'static, 'static, H>> {
+        match self.stream.controller_mut().suspended_token_mut()? {
+            SuspendedToken::Element { element, .. } => Some(element),
+            _ => None,
+        }
+    }
+
+    /// The [`EndTag`] a handler is suspended on, if any.
+    pub fn suspended_end_tag(&mut self) -> Option<&mut EndTag<'static>> {
+        match self.stream.controller_mut().suspended_token_mut()? {
+            SuspendedToken::EndTag(end_tag) => Some(end_tag),
+            _ => None,
+        }
+    }
+
+    /// The [`TextChunk`] a handler is suspended on, if any.
+    pub fn suspended_text_chunk(&mut self) -> Option<&mut TextChunk<'static>> {
+        match self.stream.controller_mut().suspended_token_mut()? {
+            SuspendedToken::TextChunk { chunk, .. } => Some(chunk),
+            _ => None,
+        }
+    }
+
+    /// The [`Comment`] a handler is suspended on, if any.
+    pub fn suspended_comment(&mut self) -> Option<&mut Comment<'static>> {
+        match self.stream.controller_mut().suspended_token_mut()? {
+            SuspendedToken::Comment { comment, .. } => Some(comment),
+            _ => None,
+        }
+    }
+
+    /// The [`Doctype`] a handler is suspended on, if any.
+    pub fn suspended_doctype(&mut self) -> Option<&mut Doctype<'static>> {
+        match self.stream.controller_mut().suspended_token_mut()? {
+            SuspendedToken::Doctype { doctype, .. } => Some(doctype),
+            _ => None,
+        }
+    }
+
+    /// The [`DocumentEnd`] a handler is suspended on, if any.
+    pub fn suspended_document_end(&mut self) -> Option<&mut DocumentEnd<'static>> {
+        match self.stream.controller_mut().suspended_token_mut()? {
+            SuspendedToken::DocumentEnd(document_end) => Some(document_end),
+            _ => None,
+        }
     }
 }
 
@@ -990,6 +1120,610 @@ mod tests {
                 DocumentContentHandlers::default(),
                 "Error in element text handler",
             );
+        }
+    }
+
+    /// Content-handler suspension (see [`SuspensionRequest`]).
+    mod suspension {
+        use super::*;
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        type TestSink = Box<dyn FnMut(&[u8])>;
+
+        /// Drives `write(chunk)*` + `end_mut()` to completion, invoking
+        /// `on_suspend(&mut rewriter)` after every suspension and then
+        /// `resume()`-ing. Returns the output and the suspension count.
+        fn drive<'h>(
+            chunks: &[&str],
+            settings: Settings<'h, '_>,
+            mut on_suspend: impl FnMut(&mut HtmlRewriter<'h, TestSink>),
+        ) -> (String, usize) {
+            let out = Rc::new(RefCell::new(Vec::<u8>::new()));
+            let out_in_sink = Rc::clone(&out);
+            let sink: TestSink = Box::new(move |c: &[u8]| {
+                out_in_sink.borrow_mut().extend_from_slice(c);
+            });
+
+            let mut rewriter = HtmlRewriter::new(settings, sink);
+            let mut suspensions = 0;
+
+            let mut pump = |rewriter: &mut HtmlRewriter<'h, TestSink>,
+                            mut res: Result<(), RewritingError>| {
+                loop {
+                    match res {
+                        Ok(()) => return,
+                        Err(RewritingError::Suspended) => {
+                            assert!(rewriter.is_suspended());
+                            suspensions += 1;
+                            on_suspend(rewriter);
+                            res = rewriter.resume();
+                        }
+                        Err(e) => panic!("unexpected rewriting error: {e}"),
+                    }
+                }
+            };
+
+            for chunk in chunks {
+                let res = rewriter.write(chunk.as_bytes());
+                pump(&mut rewriter, res);
+            }
+            let res = rewriter.end_mut();
+            pump(&mut rewriter, res);
+
+            assert!(!rewriter.is_suspended());
+            drop(rewriter);
+
+            let out = Rc::try_unwrap(out).unwrap().into_inner();
+            (String::from_utf8(out).unwrap(), suspensions)
+        }
+
+        const SUSPEND: fn() -> HandlerResult = || Err(SuspensionRequest.into());
+
+        #[test]
+        fn element_identity() {
+            // A handler that only ever suspends must not change the output.
+            let (out, n) = drive(
+                &[r#"a<div id="x">b<span>c</span></div>d"#],
+                Settings {
+                    element_content_handlers: vec![element!("div, span", |_| SUSPEND())],
+                    ..Settings::new()
+                },
+                |_| {},
+            );
+            assert_eq!(out, r#"a<div id="x">b<span>c</span></div>d"#);
+            assert_eq!(n, 2);
+        }
+
+        #[test]
+        fn element_mutations_before_and_after_suspension() {
+            let (out, n) = drive(
+                &["<div>content</div><div>two</div>"],
+                Settings {
+                    element_content_handlers: vec![element!("div", |el| {
+                        // Mutations made *before* suspending must survive it.
+                        el.set_attribute("pre", "1")?;
+                        el.before("[", ContentType::Text);
+                        SUSPEND()
+                    })],
+                    ..Settings::new()
+                },
+                |rewriter| {
+                    // Mutations made *during* the suspension, through the
+                    // parked (heap-allocated) element.
+                    let el = rewriter.suspended_element().unwrap();
+                    el.set_attribute("post", "2").unwrap();
+                    el.set_inner_content("REPLACED", ContentType::Text);
+                },
+            );
+            assert_eq!(
+                out,
+                r#"[<div pre="1" post="2">REPLACED</div>[<div pre="1" post="2">REPLACED</div>"#
+            );
+            assert_eq!(n, 2);
+        }
+
+        #[test]
+        fn later_element_handlers_run_after_resume() {
+            let order = Rc::new(RefCell::new(Vec::new()));
+            let (o1, o2, o3) = (order.clone(), order.clone(), order.clone());
+            let (out, n) = drive(
+                &["<div></div>"],
+                Settings {
+                    element_content_handlers: vec![
+                        element!("div", move |el| {
+                            o1.borrow_mut().push("a");
+                            el.set_attribute("a", "")?;
+                            SUSPEND()
+                        }),
+                        element!("div", move |el| {
+                            o2.borrow_mut().push("b");
+                            el.set_attribute("b", "")?;
+                            SUSPEND()
+                        }),
+                        element!("div", move |el| {
+                            o3.borrow_mut().push("c");
+                            el.set_attribute("c", "")?;
+                            Ok(())
+                        }),
+                    ],
+                    ..Settings::new()
+                },
+                |_| {},
+            );
+            assert_eq!(*order.borrow(), ["a", "b", "c"]);
+            assert_eq!(out, r#"<div a="" b="" c=""></div>"#);
+            assert_eq!(n, 2);
+        }
+
+        #[test]
+        fn remove_across_suspension() {
+            // `el.remove()` affects the parser's emission gating through the
+            // `handle_tag` epilogue, which the suspension skips and the
+            // resume has to replay.
+            let (out, n) = drive(
+                &["a<div>gone<span>too</span></div>b"],
+                Settings {
+                    element_content_handlers: vec![element!("div", |el| {
+                        el.remove();
+                        SUSPEND()
+                    })],
+                    ..Settings::new()
+                },
+                |_| {},
+            );
+            assert_eq!(out, "ab");
+            assert_eq!(n, 1);
+        }
+
+        #[test]
+        fn remove_during_suspension() {
+            // Same, but `remove()` is called on the parked element.
+            let (out, n) = drive(
+                &["a<div>gone<span>too</span></div>b"],
+                Settings {
+                    element_content_handlers: vec![element!("div", |_| SUSPEND())],
+                    ..Settings::new()
+                },
+                |rewriter| rewriter.suspended_element().unwrap().remove(),
+            );
+            assert_eq!(out, "ab");
+            assert_eq!(n, 1);
+        }
+
+        #[test]
+        fn set_tag_name_and_end_tag_handler_across_suspension() {
+            let (out, n) = drive(
+                &["<div>x</div>"],
+                Settings {
+                    element_content_handlers: vec![element!("div", |el: &mut Element<'_, '_>| {
+                        el.set_tag_name("section").unwrap();
+                        el.end_tag_handlers().unwrap().push(Box::new(|end| {
+                            end.before("!", ContentType::Text);
+                            Ok(())
+                        }));
+                        SUSPEND()
+                    })],
+                    ..Settings::new()
+                },
+                |_| {},
+            );
+            assert_eq!(out, "<section>x!</section>");
+            assert_eq!(n, 1);
+        }
+
+        #[test]
+        fn end_tag_handler_suspension() {
+            let (out, n) = drive(
+                &["<div>x</div>y"],
+                Settings {
+                    element_content_handlers: vec![element!("div", |el: &mut Element<'_, '_>| {
+                        el.end_tag_handlers().unwrap().push(Box::new(|_| SUSPEND()));
+                        Ok(())
+                    })],
+                    ..Settings::new()
+                },
+                |rewriter| {
+                    rewriter
+                        .suspended_end_tag()
+                        .unwrap()
+                        .after("#", ContentType::Text);
+                },
+            );
+            assert_eq!(out, "<div>x</div>#y");
+            assert_eq!(n, 1);
+        }
+
+        #[test]
+        fn text_suspension() {
+            // Suspends on every text chunk, including the empty
+            // `last_in_text_node` one fired just before the closing tag.
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let seen2 = seen.clone();
+            let (out, n) = drive(
+                &["<div>hello</div>"],
+                Settings {
+                    element_content_handlers: vec![text!("div", move |t| {
+                        seen2
+                            .borrow_mut()
+                            .push((t.as_str().to_owned(), t.last_in_text_node()));
+                        SUSPEND()
+                    })],
+                    ..Settings::new()
+                },
+                |_| {},
+            );
+            assert_eq!(out, "<div>hello</div>");
+            assert_eq!(
+                *seen.borrow(),
+                [("hello".to_owned(), false), (String::new(), true)]
+            );
+            assert_eq!(n, 2);
+        }
+
+        #[test]
+        fn text_suspension_replace_during() {
+            let (out, n) = drive(
+                &["<div>hello</div>"],
+                Settings {
+                    element_content_handlers: vec![text!("div", |t| {
+                        if t.last_in_text_node() {
+                            Ok(())
+                        } else {
+                            SUSPEND()
+                        }
+                    })],
+                    ..Settings::new()
+                },
+                |rewriter| {
+                    let chunk = rewriter.suspended_text_chunk().unwrap();
+                    assert_eq!(chunk.as_str(), "hello");
+                    chunk.replace("goodbye", ContentType::Text);
+                },
+            );
+            assert_eq!(out, "<div>goodbye</div>");
+            assert_eq!(n, 1);
+        }
+
+        #[test]
+        fn last_text_chunk_suspension_does_not_drop_the_following_element() {
+            // The `last_in_text_node` chunk is flushed from inside the
+            // lexer action that is about to emit the *next* lexeme.
+            // Suspending there must not lose that lexeme: it gets re-lexed
+            // from the suspension bookmark on resume.
+            let (out, n) = drive(
+                &["<div>text<span>inner</span>tail<!--c--></div>"],
+                Settings {
+                    element_content_handlers: vec![
+                        (
+                            Cow::Owned("div".parse().unwrap()),
+                            ElementContentHandlers::default().text(|t: &mut TextChunk<'_>| {
+                                if t.last_in_text_node() {
+                                    SUSPEND()
+                                } else {
+                                    Ok(())
+                                }
+                            }),
+                        ),
+                        element!("span", |el| {
+                            el.set_attribute("hit", "")?;
+                            Ok(())
+                        }),
+                        comments!("div", |c| {
+                            c.set_text("seen").unwrap();
+                            Ok(())
+                        }),
+                    ],
+                    ..Settings::new()
+                },
+                |_| {},
+            );
+            assert_eq!(
+                out,
+                r#"<div>text<span hit="">inner</span>tail<!--seen--></div>"#
+            );
+            // `<span>`, `</span>`, and `<!--c-->` each end a text node
+            // (there's no text between `-->` and `</div>`, so that flush
+            // is a no-op).
+            assert_eq!(n, 3);
+        }
+
+        #[test]
+        fn comment_suspension() {
+            let (out, n) = drive(
+                &["<div><!--a--></div><!--b-->"],
+                Settings {
+                    element_content_handlers: vec![comments!("div", |_| SUSPEND())],
+                    document_content_handlers: vec![doc_comments!(|_| SUSPEND())],
+                    ..Settings::new()
+                },
+                |rewriter| {
+                    let comment = rewriter.suspended_comment().unwrap();
+                    let text = comment.text();
+                    comment.set_text(&format!("{text}{text}")).unwrap();
+                },
+            );
+            // `<!--a-->` is matched by both the element and the document
+            // handler, so it suspends (and gets doubled) twice.
+            assert_eq!(out, "<div><!--aaaa--></div><!--bb-->");
+            assert_eq!(n, 3);
+        }
+
+        #[test]
+        fn doctype_suspension() {
+            let (out, n) = drive(
+                &["<!DOCTYPE html><p>x</p>"],
+                Settings {
+                    document_content_handlers: vec![doctype!(|_| SUSPEND())],
+                    ..Settings::new()
+                },
+                |rewriter| {
+                    let doctype = rewriter.suspended_doctype().unwrap();
+                    assert_eq!(doctype.name(), Some("html".into()));
+                },
+            );
+            assert_eq!(out, "<!DOCTYPE html><p>x</p>");
+            assert_eq!(n, 1);
+        }
+
+        #[test]
+        fn document_end_suspension() {
+            let (out, n) = drive(
+                &["<div></div>"],
+                Settings {
+                    document_content_handlers: vec![end!(|end| {
+                        end.append("<early>", ContentType::Html);
+                        SUSPEND()
+                    })],
+                    ..Settings::new()
+                },
+                |rewriter| {
+                    rewriter
+                        .suspended_document_end()
+                        .unwrap()
+                        .append("<late>", ContentType::Html);
+                },
+            );
+            assert_eq!(out, "<div></div><early><late>");
+            assert_eq!(n, 1);
+        }
+
+        #[test]
+        fn script_content_model_survives_suspension() {
+            // `<b>` inside `<script>` must stay raw text after the resume,
+            // i.e. the bookmark restores the ScriptData text type the
+            // tree-builder feedback set before the handler ran.
+            let (out, n) = drive(
+                &["<script>a<b>c</script><b>d</b>"],
+                Settings {
+                    element_content_handlers: vec![element!("script, b", |el| {
+                        el.set_attribute("hit", "")?;
+                        SUSPEND()
+                    })],
+                    ..Settings::new()
+                },
+                |_| {},
+            );
+            // Only `<script>` and the *real* `<b>` match; the one inside the
+            // script is raw text.
+            assert_eq!(out, r#"<script hit="">a<b>c</script><b hit="">d</b>"#);
+            assert_eq!(n, 2);
+        }
+
+        #[test]
+        fn multi_chunk_input() {
+            for chunk_size in [1, 2, 3, 7] {
+                let html = r#"pre<div id="a">in<span>ner</span></div><!--c-->post"#;
+                let chunks: Vec<String> = html
+                    .as_bytes()
+                    .chunks(chunk_size)
+                    .map(|c| String::from_utf8(c.to_vec()).unwrap())
+                    .collect();
+                let chunks: Vec<&str> = chunks.iter().map(String::as_str).collect();
+
+                let (out, n) = drive(
+                    &chunks,
+                    Settings {
+                        element_content_handlers: vec![element!("div, span", |el| {
+                            el.set_attribute("hit", "")?;
+                            SUSPEND()
+                        })],
+                        document_content_handlers: vec![doc_comments!(|_| SUSPEND())],
+                        ..Settings::new()
+                    },
+                    |_| {},
+                );
+                assert_eq!(
+                    out, r#"pre<div id="a" hit="">in<span hit="">ner</span></div><!--c-->post"#,
+                    "chunk_size={chunk_size}"
+                );
+                assert_eq!(n, 3, "chunk_size={chunk_size}");
+            }
+        }
+
+        #[test]
+        fn suspension_does_not_poison() {
+            let mut rewriter = HtmlRewriter::new(
+                Settings {
+                    element_content_handlers: vec![element!("div", |_| SUSPEND())],
+                    encoding: AsciiCompatibleEncoding::utf_8(),
+                    ..Settings::new()
+                },
+                |_: &[u8]| {},
+            );
+
+            assert!(matches!(
+                rewriter.write(b"<div>"),
+                Err(RewritingError::Suspended)
+            ));
+            // A poisoned rewriter would panic here.
+            rewriter.resume().unwrap();
+            rewriter.end_mut().unwrap();
+        }
+
+        #[test]
+        fn real_handler_error_still_poisons() {
+            let mut rewriter = HtmlRewriter::new(
+                Settings {
+                    element_content_handlers: vec![element!("div", |_| Err("boom".into()))],
+                    encoding: AsciiCompatibleEncoding::utf_8(),
+                    ..Settings::new()
+                },
+                |_: &[u8]| {},
+            );
+
+            assert!(matches!(
+                rewriter.write(b"<div>"),
+                Err(RewritingError::ContentHandlerError(_))
+            ));
+            assert!(!rewriter.is_suspended());
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = rewriter.write(b"x");
+                }))
+                .is_err()
+            );
+        }
+
+        /// Records the order handlers fire in, plus the serialized output.
+        fn eof_order(input: &str) -> (Vec<&'static str>, String) {
+            let order = Rc::new(RefCell::new(Vec::new()));
+            let (o_text, o_comment, o_doctype) = (order.clone(), order.clone(), order.clone());
+            let (out, _) = drive(
+                &[input],
+                Settings {
+                    document_content_handlers: vec![
+                        doc_text!(move |t| {
+                            if t.last_in_text_node() {
+                                o_text.borrow_mut().push("text-last");
+                            }
+                            Ok(())
+                        }),
+                        doc_comments!(move |_| {
+                            o_comment.borrow_mut().push("comment");
+                            Ok(())
+                        }),
+                        doctype!(move |_| {
+                            o_doctype.borrow_mut().push("doctype");
+                            Ok(())
+                        }),
+                    ],
+                    ..Settings::new()
+                },
+                |_| {},
+            );
+            let order = order.borrow().clone();
+            (order, out)
+        }
+
+        // `emit_current_token_and_eof` must flush the pending last text chunk
+        // before the comment/doctype lexeme it builds, exactly like the
+        // non-EOF `emit_current_token` does. Otherwise an input that ends
+        // inside a comment (a truncated upstream body) dispatches the comment
+        // first, inverting both handler order and output byte order.
+        #[test]
+        fn pending_text_flushes_before_unterminated_comment_at_eof() {
+            let (order, out) = eof_order("hello<!-- unterminated");
+            assert_eq!(order, ["text-last", "comment"]);
+            assert_eq!(out, "hello<!-- unterminated");
+        }
+
+        #[test]
+        fn pending_text_flushes_before_unterminated_doctype_at_eof() {
+            let (order, out) = eof_order("hello<!doctype html");
+            assert_eq!(order, ["text-last", "doctype"]);
+            assert_eq!(out, "hello<!doctype html");
+        }
+
+        // The same hoist, on the `emit_raw_without_token_and_eof` path: an
+        // input that ends inside an unterminated tag.
+        #[test]
+        fn pending_text_flushes_before_unterminated_tag_at_eof() {
+            let (order, out) = eof_order("hello<div attr");
+            assert_eq!(order, ["text-last"]);
+            assert_eq!(out, "hello<div attr");
+        }
+
+        // `resume_dispatch` step 2 re-serializes the parked token, but only
+        // when emission is enabled. A handler suspending inside content an
+        // outer handler removed must not resurrect that content.
+        #[test]
+        fn suspension_inside_removed_content_emits_nothing() {
+            let (out, n) = drive(
+                &["a<div>b<span>c</span>d</div>e"],
+                Settings {
+                    element_content_handlers: vec![
+                        element!("div", |el| {
+                            el.remove();
+                            Ok(())
+                        }),
+                        // Runs against content that is being removed.
+                        element!("span", |_| SUSPEND()),
+                    ],
+                    document_content_handlers: vec![doc_text!(|_| SUSPEND())],
+                    ..Settings::new()
+                },
+                |_| {},
+            );
+            assert_eq!(out, "ae");
+            assert!(n > 0, "the handlers must actually have suspended");
+        }
+
+        // `emit_raw_without_token`'s flush hoist: `<![CDATA[` in foreign
+        // content is the only lexeme that reaches it.
+        #[test]
+        fn text_suspension_around_cdata() {
+            let chunks = Rc::new(RefCell::new(Vec::new()));
+            let c = chunks.clone();
+            let (out, n) = drive(
+                &["<svg><foo>a<![CDATA[b]]>c</foo></svg>"],
+                Settings {
+                    document_content_handlers: vec![doc_text!(move |t| {
+                        c.borrow_mut().push(t.as_str().to_owned());
+                        SUSPEND()
+                    })],
+                    ..Settings::new()
+                },
+                |_| {},
+            );
+            assert_eq!(out, "<svg><foo>a<![CDATA[b]]>c</foo></svg>");
+            assert!(n > 0);
+            assert!(
+                chunks.borrow().iter().any(|t| t == "a"),
+                "expected a text chunk 'a' before the CDATA, got {:?}",
+                chunks.borrow()
+            );
+        }
+
+        // A text handler that suspends on the last chunk, flushed from inside
+        // the composite EOF action: the resume must still emit the comment.
+        #[test]
+        fn text_suspension_at_unterminated_comment_eof() {
+            let order = Rc::new(RefCell::new(Vec::new()));
+            let (o_text, o_comment) = (order.clone(), order.clone());
+            let (out, n) = drive(
+                &["hello<!-- unterminated"],
+                Settings {
+                    document_content_handlers: vec![
+                        doc_text!(move |t| {
+                            if t.last_in_text_node() {
+                                o_text.borrow_mut().push("text-last");
+                                return SUSPEND();
+                            }
+                            Ok(())
+                        }),
+                        doc_comments!(move |_| {
+                            o_comment.borrow_mut().push("comment");
+                            Ok(())
+                        }),
+                    ],
+                    ..Settings::new()
+                },
+                |_| {},
+            );
+            assert_eq!(*order.borrow(), ["text-last", "comment"]);
+            assert_eq!(out, "hello<!-- unterminated");
+            assert_eq!(n, 1);
         }
     }
 }

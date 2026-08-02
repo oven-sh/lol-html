@@ -10,8 +10,8 @@ pub(crate) use self::lexer::{
     AttributeBuffer, AttributeOutline, Lexeme, LexemeSink, NonTagContentLexeme,
     NonTagContentTokenOutline, TagLexeme, TagTokenOutline,
 };
-use self::state_machine::StateMachine;
 pub(crate) use self::state_machine::{ActionError, ActionResult};
+use self::state_machine::{ParseResult, StateMachine, StateMachineBookmark};
 pub(crate) use self::tag_scanner::TagHintSink;
 use self::tag_scanner::TagScanner;
 pub use self::tree_builder_simulator::ParsingAmbiguityError;
@@ -45,6 +45,11 @@ pub struct Parser<S> {
     tag_scanner: TagScanner<S>,
     current_directive: ParserDirective,
     context: ParserContext<S>,
+    /// Set when a content handler suspended the dispatch mid-parse (see
+    /// [`RewritingError::Suspended`]). Holds the state-machine bookmark
+    /// (positions relative to the re-buffered unconsumed tail) that
+    /// [`Self::resume`] continues from.
+    suspension: Option<StateMachineBookmark>,
 }
 
 // public only for integration tests
@@ -64,6 +69,7 @@ impl<S: ParserOutputSink> Parser<S> {
             tag_scanner: TagScanner::new(),
             current_directive: initial_directive,
             context,
+            suspension: None,
         }
     }
 
@@ -72,7 +78,9 @@ impl<S: ParserOutputSink> Parser<S> {
     // It's better to outline it, and let its callers be inlined.
     #[inline(never)]
     pub fn parse(&mut self, input: &[u8], last: bool) -> Result<usize, RewritingError> {
-        let mut parse_result = match self.current_directive {
+        debug_assert!(self.suspension.is_none());
+
+        let parse_result = match self.current_directive {
             ParserDirective::WherePossibleScanForTagsOnly => {
                 self.tag_scanner
                     .run_parsing_loop(&mut self.context, input, last)
@@ -80,6 +88,58 @@ impl<S: ParserOutputSink> Parser<S> {
             ParserDirective::Lex => self.lexer.run_parsing_loop(&mut self.context, input, last),
         };
 
+        self.handle_parse_result(parse_result, input, last)
+    }
+
+    /// `true` if the last `parse`/`resume` call was suspended by a content
+    /// handler. The number of bytes it reported as consumed is final; the
+    /// rest of the input must be buffered and handed back to [`Self::resume`].
+    #[inline]
+    pub const fn is_suspended(&self) -> bool {
+        self.suspension.is_some()
+    }
+
+    /// Continues a suspended parse over the re-buffered unconsumed tail.
+    /// Must only be called once the suspended dispatch itself has been
+    /// resumed (see `Dispatcher::resume_dispatch`). `directive`, when given,
+    /// is the one the suspended `handle_tag` never got to return.
+    #[inline(never)]
+    pub fn resume(
+        &mut self,
+        input: &[u8],
+        last: bool,
+        directive: Option<ParserDirective>,
+    ) -> Result<usize, RewritingError> {
+        let bookmark = self
+            .suspension
+            .take()
+            .expect("Parser::resume called without a suspension");
+
+        if let Some(directive) = directive {
+            self.current_directive = directive;
+        }
+
+        trace!(@continue_from_bookmark bookmark, self.current_directive, input);
+
+        let parse_result = match self.current_directive {
+            ParserDirective::WherePossibleScanForTagsOnly => self
+                .tag_scanner
+                .continue_from_bookmark(&mut self.context, input, last, bookmark),
+            ParserDirective::Lex => {
+                self.lexer
+                    .continue_from_bookmark(&mut self.context, input, last, bookmark)
+            }
+        };
+
+        self.handle_parse_result(parse_result, input, last)
+    }
+
+    fn handle_parse_result(
+        &mut self,
+        mut parse_result: ParseResult,
+        input: &[u8],
+        last: bool,
+    ) -> Result<usize, RewritingError> {
         loop {
             let unboxed = match parse_result {
                 Ok(unreachable) => match unreachable {},
@@ -90,6 +150,14 @@ impl<S: ParserOutputSink> Parser<S> {
                     consumed_byte_count,
                 } => {
                     self.context.previously_consumed_byte_count += consumed_byte_count;
+                    return Ok(consumed_byte_count);
+                }
+                ActionError::Suspended {
+                    consumed_byte_count,
+                    bookmark,
+                } => {
+                    self.context.previously_consumed_byte_count += consumed_byte_count;
+                    self.suspension = Some(bookmark);
                     return Ok(consumed_byte_count);
                 }
                 ActionError::ParserDirectiveChangeRequired(new_directive, sm_bookmark) => {

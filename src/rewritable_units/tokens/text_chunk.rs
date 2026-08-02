@@ -78,7 +78,7 @@ pub struct TextChunk<'i> {
     last_in_text_node: bool,
     encoding: &'static Encoding,
     mutations: Mutations,
-    user_data: Box<dyn Any>,
+    user_data: Box<dyn Any + Send>,
     source_location: SourceLocation,
 }
 
@@ -106,6 +106,21 @@ impl<'i> TextChunk<'i> {
     #[inline(always)]
     pub(crate) fn encoding(&self) -> &'static Encoding {
         self.encoding
+    }
+
+    /// Detaches the chunk from the parser's text buffer so it can outlive the
+    /// current `write()` call (handler suspension). Leaves `self` behind in a
+    /// drained state; the caller abandons it.
+    pub(crate) fn take_owned(&mut self) -> TextChunk<'static> {
+        TextChunk {
+            text: Cow::Owned(std::mem::take(&mut self.text).into_owned()),
+            text_type: self.text_type,
+            last_in_text_node: self.last_in_text_node,
+            encoding: self.encoding,
+            mutations: std::mem::replace(&mut self.mutations, Mutations::new()),
+            user_data: std::mem::replace(&mut self.user_data, Box::new(())),
+            source_location: self.source_location.clone(),
+        }
     }
 
     /// Returns the content of the chunk, which [`may not be a complete text node`](TextChunk).

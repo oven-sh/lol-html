@@ -9,6 +9,24 @@ pub(crate) struct TextDecoder {
     pending_source_location_bytes_start: usize,
     pending_text_streaming_decoder: Option<Decoder>,
     text_buffer: String,
+    /// Where the current `feed_text` call was when a text handler suspended
+    /// (`None` otherwise). Recorded *only* on the error path so the success
+    /// path pays nothing.
+    suspended: Option<TextFeedSuspension>,
+}
+
+/// Where a [`TextDecoder::feed_text`] call was when the text handler for one
+/// of its chunks suspended. Lets [`TextDecoder::resume_feed`] finish decoding
+/// the rest of that text lexeme once the parked chunk completes. The
+/// undecoded tail is copied because it pointed into the `write()` call's
+/// input buffer, which is gone by the time the resume runs.
+pub(crate) struct TextFeedSuspension {
+    remaining: Vec<u8>,
+    next_source_location_bytes_start: usize,
+    last_in_text_node: bool,
+    /// `true` if the chunk that suspended was this feed's final one; the
+    /// resume then only has to run the loop's epilogue.
+    finished: bool,
 }
 
 pub(crate) type OutputHandlerCallback<'tmp> =
@@ -25,6 +43,7 @@ impl TextDecoder {
             // this will be later initialized to DEFAULT_BUFFER_LEN,
             // because encoding_rs wants a slice
             text_buffer: String::new(),
+            suspended: None,
         }
     }
 
@@ -41,6 +60,39 @@ impl TextDecoder {
             )?;
         }
         Ok(())
+    }
+
+    /// The feed state recorded when a text handler suspended, if any.
+    #[inline]
+    pub fn take_suspended(&mut self) -> Option<TextFeedSuspension> {
+        self.suspended.take()
+    }
+
+    /// Continues a `feed_text` call that a text handler suspended, starting
+    /// right after the chunk that suspended.
+    pub fn resume_feed(
+        &mut self,
+        suspension: TextFeedSuspension,
+        output_handler: &mut OutputHandlerCallback<'_>,
+    ) -> Result<(), RewritingError> {
+        if suspension.finished {
+            // The chunk that suspended was this feed's final one: only the
+            // loop epilogue is left.
+            if suspension.last_in_text_node {
+                self.pending_text_streaming_decoder = None;
+            } else {
+                self.pending_source_location_bytes_start =
+                    suspension.next_source_location_bytes_start;
+            }
+            return Ok(());
+        }
+
+        self.feed_decoder_loop(
+            &suspension.remaining,
+            suspension.next_source_location_bytes_start,
+            suspension.last_in_text_node,
+            output_handler,
+        )
     }
 
     #[inline(never)]
@@ -63,13 +115,41 @@ impl TextDecoder {
                 SourceLocation::from_start_len(next_source_location_bytes_start, utf8_text.len());
             next_source_location_bytes_start = source_location.bytes().end;
 
-            (output_handler)(utf8_text, really_last, encoding, source_location)?;
+            let res = (output_handler)(utf8_text, really_last, encoding, source_location);
+            if res.is_err() {
+                self.suspended = Some(TextFeedSuspension {
+                    remaining: rest.to_vec(),
+                    next_source_location_bytes_start,
+                    last_in_text_node,
+                    finished: really_last,
+                });
+            }
+            res?;
 
             if really_last {
                 debug_assert!(self.pending_text_streaming_decoder.is_none());
                 return Ok(());
             }
         }
+
+        self.feed_decoder_loop(
+            raw_input,
+            next_source_location_bytes_start,
+            last_in_text_node,
+            output_handler,
+        )
+    }
+
+    /// The streaming-decoder tail of [`Self::feed_text`], also the re-entry
+    /// point for [`Self::resume_feed`].
+    fn feed_decoder_loop(
+        &mut self,
+        mut raw_input: &[u8],
+        mut next_source_location_bytes_start: usize,
+        last_in_text_node: bool,
+        output_handler: &mut OutputHandlerCallback<'_>,
+    ) -> Result<(), RewritingError> {
+        let encoding = self.encoding.get();
 
         if self.pending_text_streaming_decoder.is_none() && self.text_buffer.is_empty() {
             // repeat() avoids utf8 check comapred to `String::from_utf8(vec![0; len])`
@@ -94,13 +174,22 @@ impl TextDecoder {
                 // but only one call to output_handler can be *the* last one.
                 let really_last = last_in_text_node && finished_decoding;
 
-                (output_handler)(
+                let res = (output_handler)(
                     // this will always be in bounds, but unwrap_or_default optimizes better
                     buffer.get(..written).unwrap_or_default(),
                     really_last,
                     encoding,
                     source_location,
-                )?;
+                );
+                if res.is_err() {
+                    self.suspended = Some(TextFeedSuspension {
+                        remaining: raw_input.get(read..).unwrap_or_default().to_vec(),
+                        next_source_location_bytes_start,
+                        last_in_text_node,
+                        finished: finished_decoding,
+                    });
+                }
+                res?;
             }
 
             if finished_decoding {

@@ -1,5 +1,8 @@
+use super::mutations::{DynamicString, StringChunk};
 use super::{ContentType, StreamingHandlerSink};
+use crate::errors::RewritingError;
 use encoding_rs::Encoding;
+use std::marker::PhantomData;
 
 use crate::transform_stream::OutputSink;
 
@@ -8,19 +11,45 @@ use crate::transform_stream::OutputSink;
 /// This exposes the [append](#method.append) function that can be used to append content at the
 /// end of the document. The content will only be appended after the rewriter has finished processing
 /// the final chunk.
+// Note: appended content is buffered (as a `DynamicString`, like every other
+// mutation) and flushed to the output sink once all the document-end handlers
+// have run. This is what lets the unit own all of its state, which in turn
+// lets a handler suspend on it. The lifetime parameter is kept for backward
+// compatibility with the `DocumentEnd<'_>` spelling; the type owns everything.
 pub struct DocumentEnd<'a> {
-    output_sink: &'a mut dyn OutputSink,
+    appended: DynamicString,
     encoding: &'static Encoding,
+    _lifetime: PhantomData<&'a ()>,
 }
 
 impl<'a> DocumentEnd<'a> {
     #[inline]
     #[must_use]
-    pub(crate) fn new(output_sink: &'a mut dyn OutputSink, encoding: &'static Encoding) -> Self {
+    pub(crate) fn new(encoding: &'static Encoding) -> Self {
         DocumentEnd {
-            output_sink,
+            appended: DynamicString::new(),
             encoding,
+            _lifetime: PhantomData,
         }
+    }
+
+    /// Detaches the unit so it can outlive the current `end()` call (handler
+    /// suspension). Leaves `self` behind empty; the caller abandons it.
+    pub(crate) fn take_owned(&mut self) -> DocumentEnd<'static> {
+        DocumentEnd {
+            appended: std::mem::take(&mut self.appended),
+            encoding: self.encoding,
+            _lifetime: PhantomData,
+        }
+    }
+
+    /// Encodes the buffered appends into `output_sink`. Consumes the unit.
+    pub(crate) fn flush_into(self, output_sink: &mut dyn OutputSink) -> Result<(), RewritingError> {
+        let mut handle_chunk = |c: &[u8]| output_sink.handle_chunk(c);
+        let mut sink = StreamingHandlerSink::new(self.encoding, &mut handle_chunk);
+        self.appended
+            .encode(&mut sink)
+            .map_err(RewritingError::ContentHandlerError)
     }
 
     /// Appends `content` at the end of the document.
@@ -49,10 +78,8 @@ impl<'a> DocumentEnd<'a> {
     /// ```
     #[inline]
     pub fn append(&mut self, content: &str, content_type: ContentType) {
-        StreamingHandlerSink::new(self.encoding, &mut |c| {
-            self.output_sink.handle_chunk(c);
-        })
-        .write_str(content, content_type);
+        self.appended
+            .push_back(StringChunk::from_str(content, content_type));
     }
 }
 

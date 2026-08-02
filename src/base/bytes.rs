@@ -59,6 +59,16 @@ impl<'b> BytesCow<'b> {
         BytesCow(Cow::Owned(self.0.into_owned()))
     }
 
+    /// Detaches the bytes from the input buffer they may borrow, leaving an
+    /// empty value behind. Used when a token has to outlive the parser's
+    /// input buffer (handler suspension).
+    #[inline]
+    pub(crate) fn take_owned(&mut self) -> BytesCow<'static> {
+        BytesCow(Cow::Owned(
+            std::mem::replace(&mut self.0, Cow::Borrowed(&[])).into_owned(),
+        ))
+    }
+
     #[inline]
     pub(crate) fn as_ref(&self) -> Bytes<'_> {
         Bytes(&self.0)
@@ -75,7 +85,7 @@ impl<'b> BytesCow<'b> {
 
 impl<'b> Bytes<'b> {
     #[inline]
-    pub(crate) fn new(bytes: &'b [u8]) -> Self {
+    pub(crate) const fn new(bytes: &'b [u8]) -> Self {
         Self(bytes)
     }
 

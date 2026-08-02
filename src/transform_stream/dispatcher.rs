@@ -3,8 +3,7 @@ use crate::html::{LocalName, Namespace};
 use crate::html_content::{TextChunk, TextType};
 use crate::parser::{
     ActionError, ActionResult, AttributeBuffer, Lexeme, LexemeSink, NonTagContentLexeme,
-    NonTagContentTokenOutline, ParserDirective, ParserOutputSink, TagHintSink, TagLexeme,
-    TagTokenOutline,
+    ParserDirective, ParserOutputSink, TagHintSink, TagLexeme, TagTokenOutline,
 };
 use crate::rewritable_units::TextDecoder;
 use crate::rewritable_units::ToTokenResult;
@@ -43,6 +42,40 @@ pub trait TransformController: Sized {
     fn handle_token(&mut self, token: &mut Token<'_>) -> Result<(), RewritingError>;
     fn handle_end(&mut self, document_end: &mut DocumentEnd<'_>) -> Result<(), RewritingError>;
     fn should_emit_content(&self) -> bool;
+
+    /// Runs the handlers that had not yet run for the token a previous
+    /// `handle_token` parked (see [`RewritingError::Suspended`]) and returns
+    /// the completed, owned token for serialization. May suspend again.
+    ///
+    /// Only called after `handle_token` returned `RewritingError::Suspended`.
+    fn resume_suspended_token(&mut self) -> Result<Token<'static>, RewritingError> {
+        unreachable!("this TransformController does not support suspension")
+    }
+
+    /// Same as [`Self::resume_suspended_token`], for a [`DocumentEnd`] that
+    /// `handle_end` parked.
+    fn resume_suspended_document_end(&mut self) -> Result<DocumentEnd<'static>, RewritingError> {
+        unreachable!("this TransformController does not support suspension")
+    }
+}
+
+/// Where in the dispatch pipeline a suspension escaped from. Decides which
+/// epilogue [`Dispatcher::resume_dispatch`] has to replay.
+#[derive(Copy, Clone)]
+enum SuspensionSite {
+    /// `handle_tag`'s `try_produce_token_from_lexeme`: the tag's own token.
+    /// The `emission_enabled` update and the returned `ParserDirective` were
+    /// skipped and must be recomputed on resume.
+    Tag,
+    /// `handle_non_tag_content` or the pre-lexeme `flush_pending_text`:
+    /// neither has an epilogue, and the parser directive doesn't change.
+    NonTag,
+}
+
+/// `true` iff `e` is the non-fatal suspension escape.
+#[inline]
+fn is_suspension(e: &ActionError) -> bool {
+    matches!(e, ActionError::RewritingError(RewritingError::Suspended))
 }
 
 /// Defines an interface for the [`HtmlRewriter`]'s output.
@@ -74,6 +107,9 @@ pub struct Dispatcher<C, O> {
     got_flags_from_hint: bool,
     pending_element_aux_info_req: Option<AuxStartTagInfoRequest<C>>,
     encoding: SharedEncoding,
+    /// `Some` while a content handler has the dispatch suspended. The parked
+    /// token itself lives on the transform controller.
+    suspended_at: Option<SuspensionSite>,
 }
 
 /// Fields split out of `Dispatcher` for borrow checking of event handlers
@@ -107,9 +143,17 @@ where
     fn finish(&mut self, encoding: &'static Encoding, input: &[u8]) -> Result<(), RewritingError> {
         self.flush_remaining_input(input, input.len());
 
-        let mut document_end = DocumentEnd::new(&mut self.output_sink, encoding);
+        let mut document_end = DocumentEnd::new(encoding);
 
         self.transform_controller.handle_end(&mut document_end)?;
+
+        self.flush_document_end(document_end)
+    }
+
+    /// Encode the buffered document-end appends to the output sink and emit
+    /// the zero-length finalizing chunk.
+    fn flush_document_end(&mut self, document_end: DocumentEnd<'_>) -> Result<(), RewritingError> {
+        document_end.flush_into(&mut self.output_sink)?;
 
         // NOTE: output the finalizing chunk.
         self.output_sink.handle_chunk(&[]);
@@ -200,6 +244,7 @@ where
             encoding,
             got_flags_from_hint: false,
             pending_element_aux_info_req: None,
+            suspended_at: None,
         }
     }
 
@@ -350,6 +395,85 @@ where
     pub fn finish(&mut self, input: &[u8]) -> Result<(), RewritingError> {
         self.delegate.finish(self.encoding.get(), input)
     }
+
+    /// The transform controller, for reaching the parked token of a
+    /// suspension from the embedder.
+    pub(crate) const fn transform_controller_mut(&mut self) -> &mut C {
+        &mut self.delegate.transform_controller
+    }
+
+    /// Completes a dispatch that a content handler suspended: runs the
+    /// remaining handlers for the parked token, serializes it, drains the
+    /// rest of the text lexeme it may have come from, and replays the
+    /// `handle_tag` epilogue the suspension skipped.
+    ///
+    /// Returns the `ParserDirective` that `handle_tag` never got to return,
+    /// or `None` when the suspension was not on a tag lexeme's own token (the
+    /// directive is then unchanged).
+    ///
+    /// If a later handler suspends, the new token is parked (the dispatcher
+    /// stays suspended) and `RewritingError::Suspended` is returned; call
+    /// again once it settles.
+    pub(crate) fn resume_dispatch(&mut self) -> Result<Option<ParserDirective>, RewritingError> {
+        let site = *self
+            .suspended_at
+            .as_ref()
+            .expect("resume_dispatch called without a pending suspension");
+
+        // 1. The handlers that had not yet run for the parked token.
+        let token = self
+            .delegate
+            .transform_controller
+            .resume_suspended_token()?;
+
+        // 2. The serialization step `token_produced`/`text_token_produced`
+        //    never reached.
+        if self.delegate.emission_enabled {
+            token.into_bytes(&mut |c| self.delegate.output_sink.handle_chunk(c))?;
+        }
+
+        // 3. If the token was a chunk of a partially-decoded text lexeme,
+        //    keep feeding the decoder. Every produced chunk goes through
+        //    `text_token_produced` and can suspend again (re-recording the
+        //    decoder's state), so loop until the feed runs dry.
+        while let Some(feed) = self.text_decoder.take_suspended() {
+            self.text_decoder.resume_feed(
+                feed,
+                &mut |text, is_last, encoding, source_location| {
+                    self.delegate.text_token_produced(
+                        text,
+                        encoding,
+                        self.last_text_type,
+                        is_last,
+                        source_location,
+                    )
+                },
+            )?;
+        }
+
+        self.suspended_at = None;
+
+        match site {
+            SuspensionSite::Tag => {
+                // The epilogue of `handle_tag`.
+                self.delegate.emission_enabled =
+                    self.delegate.transform_controller.should_emit_content();
+
+                Ok(Some(self.get_next_parser_directive()))
+            }
+            SuspensionSite::NonTag => Ok(None),
+        }
+    }
+
+    /// Completes a `finish` that a document-end handler suspended.
+    pub(crate) fn resume_finish(&mut self) -> Result<(), RewritingError> {
+        let document_end = self
+            .delegate
+            .transform_controller
+            .resume_suspended_document_end()?;
+
+        self.delegate.flush_document_end(document_end)
+    }
 }
 
 impl<C, O> LexemeSink for Dispatcher<C, O>
@@ -358,13 +482,9 @@ where
     O: OutputSink,
 {
     fn handle_tag(&mut self, lexeme: &TagLexeme<'_>) -> ActionResult<ParserDirective> {
-        // NOTE: flush pending text before reporting tag to the transform controller.
-        // Otherwise, transform controller can enable or disable text handlers too early.
-        // In case of start tag, newly matched element text handlers
-        // will receive leftovers from the previous match. And, in case of end tag,
-        // handlers will be disabled before the receive the finalizing chunk.
-        self.flush_pending_captured_text()?;
-
+        // NOTE: the pending captured text is flushed by the lexer *before*
+        // this lexeme was built (see `Lexer::emit_tag`), so by now the
+        // transform controller can safely enable/disable text handlers.
         if self.got_flags_from_hint {
             self.got_flags_from_hint = false;
         } else {
@@ -378,7 +498,13 @@ where
             }
         }
 
-        self.try_produce_token_from_lexeme(lexeme)?;
+        if let Err(e) = self.try_produce_token_from_lexeme(lexeme) {
+            if is_suspension(&e) {
+                self.suspended_at = Some(SuspensionSite::Tag);
+            }
+            return Err(e);
+        }
+
         self.delegate.emission_enabled = self.delegate.transform_controller.should_emit_content();
 
         Ok(self.get_next_parser_directive())
@@ -386,12 +512,26 @@ where
 
     #[inline]
     fn handle_non_tag_content(&mut self, lexeme: &NonTagContentLexeme<'_>) -> ActionResult {
-        match lexeme.token_outline() {
-            Some(NonTagContentTokenOutline::Text(_)) => {}
-            // when it's None, it still needs a flush for CDATA
-            _ => self.flush_pending_captured_text()?,
+        // NOTE: for non-text lexemes the pending captured text was already
+        // flushed by the lexer (see `Lexer::emit_current_token` & friends).
+        if let Err(e) = self.try_produce_token_from_lexeme(lexeme) {
+            if is_suspension(&e) {
+                self.suspended_at = Some(SuspensionSite::NonTag);
+            }
+            return Err(e);
         }
-        self.try_produce_token_from_lexeme(lexeme)
+        Ok(())
+    }
+
+    fn flush_pending_text(&mut self) -> ActionResult {
+        if let Err(e) = self.flush_pending_captured_text() {
+            let e: Box<ActionError> = e.into();
+            if is_suspension(&e) {
+                self.suspended_at = Some(SuspensionSite::NonTag);
+            }
+            return Err(e);
+        }
+        Ok(())
     }
 }
 

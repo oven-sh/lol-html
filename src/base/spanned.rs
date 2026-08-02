@@ -48,9 +48,13 @@ pub(crate) struct Spanned<B> {
     source_location_byte_start: usize,
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 pub(crate) enum RawBytes<'input> {
     Original(&'input [u8]),
+    /// Raw bytes copied out of the input buffer so that they can outlive it.
+    /// Produced by [`SpannedRawBytes::take_owned`] when a token is detached
+    /// from the parser (handler suspension).
+    Owned(Box<[u8]>),
     /// Keeps the len of the original
     Modified(usize),
 }
@@ -58,9 +62,10 @@ pub(crate) enum RawBytes<'input> {
 impl<'input> SpannedRawBytes<'input> {
     #[inline]
     pub fn len(&self) -> usize {
-        match self.bytes {
+        match &self.bytes {
             RawBytes::Original(s) => s.len(),
-            RawBytes::Modified(l) => l,
+            RawBytes::Owned(s) => s.len(),
+            RawBytes::Modified(l) => *l,
         }
     }
 
@@ -71,10 +76,27 @@ impl<'input> SpannedRawBytes<'input> {
     }
 
     #[inline]
-    pub fn original(&self) -> Option<&'input [u8]> {
-        match self.bytes {
+    pub fn original(&self) -> Option<&[u8]> {
+        match &self.bytes {
             RawBytes::Original(s) => Some(s),
+            RawBytes::Owned(s) => Some(s),
             RawBytes::Modified(_) => None,
+        }
+    }
+
+    /// Detaches the raw bytes from the input buffer, leaving `self` behind as
+    /// `Modified(len)` (the source is abandoned after a `take_owned`, so the
+    /// leftover only has to keep `len()`/`source_location()` correct).
+    pub(crate) fn take_owned(&mut self) -> SpannedRawBytes<'static> {
+        let len = self.len();
+        let bytes = match std::mem::replace(&mut self.bytes, RawBytes::Modified(len)) {
+            RawBytes::Original(s) => RawBytes::Owned(s.into()),
+            RawBytes::Owned(s) => RawBytes::Owned(s),
+            RawBytes::Modified(l) => RawBytes::Modified(l),
+        };
+        Spanned {
+            bytes,
+            source_location_byte_start: self.source_location_byte_start,
         }
     }
 

@@ -19,6 +19,10 @@ macro_rules! get_token_part_range {
 
 impl<S: LexemeSink> Lexer<S> {
     fn emit_eof(&mut self, context: &mut ParserContext<S>, input: &[u8]) -> ActionResult {
+        // The EOF ends the final text node; flush its pending last chunk
+        // before the lexeme exists so a suspension can simply re-lex the EOF.
+        self.flush_pending_text(context)?;
+
         let lexeme = self.create_lexeme_with_raw_exclusive(
             context.previously_consumed_byte_count,
             input,
@@ -61,6 +65,11 @@ impl<S: LexemeSink> StateMachineActions for Lexer<S> {
 
     #[inline(never)]
     fn emit_current_token(&mut self, context: &mut ParserContext<S>, input: &[u8]) -> ActionResult {
+        // A comment/doctype ends the preceding text node; flush its pending
+        // last chunk before the lexeme exists so a suspension can simply
+        // re-lex the comment/doctype (`lexeme_start` still points at it).
+        self.flush_pending_text(context)?;
+
         let token = self.current_non_tag_content_token.take();
         let lexeme = self.create_lexeme_with_raw_inclusive(
             context.previously_consumed_byte_count,
@@ -73,6 +82,14 @@ impl<S: LexemeSink> StateMachineActions for Lexer<S> {
 
     #[inline(never)]
     fn emit_tag(&mut self, context: &mut ParserContext<S>, input: &[u8]) -> ActionResult {
+        // A tag ends the preceding text node. Flush its pending last chunk
+        // *before* building the lexeme or applying tree-builder feedback: a
+        // text handler that suspends here leaves no live lexeme above it,
+        // the tree-builder simulator untouched, and `last_text_type` at the
+        // pre-tag value, so the resume just re-lexes the tag from
+        // `lexeme_start` (which still points at its `<`).
+        self.flush_pending_text(context)?;
+
         let token = self
             .current_tag_token
             .take()
@@ -120,6 +137,11 @@ impl<S: LexemeSink> StateMachineActions for Lexer<S> {
         context: &mut ParserContext<S>,
         input: &[u8],
     ) -> ActionResult {
+        // As in `emit_current_token`: the comment/doctype ends the preceding
+        // text node, so flush its pending last chunk before the lexeme is
+        // built. `emit_eof` below then finds nothing left to flush.
+        self.flush_pending_text(context)?;
+
         let token = self.current_non_tag_content_token.take();
         let lexeme = self.create_lexeme_with_raw_exclusive(
             context.previously_consumed_byte_count,
@@ -138,6 +160,9 @@ impl<S: LexemeSink> StateMachineActions for Lexer<S> {
         context: &mut ParserContext<S>,
         input: &[u8],
     ) -> ActionResult {
+        // A CDATA marker ends the preceding text node (see `emit_tag`).
+        self.flush_pending_text(context)?;
+
         let lexeme = self.create_lexeme_with_raw_inclusive(
             context.previously_consumed_byte_count,
             input,
@@ -153,6 +178,12 @@ impl<S: LexemeSink> StateMachineActions for Lexer<S> {
         context: &mut ParserContext<S>,
         input: &[u8],
     ) -> ActionResult {
+        // As in `emit_raw_without_token`. This lexeme carries no token, so
+        // nothing is dispatched between here and `emit_eof`'s own flush, but
+        // keeping the hoist uniform means every suspension point sees the
+        // in-flight lexeme either fully consumed or not yet built.
+        self.flush_pending_text(context)?;
+
         // NOTE: since we are at EOF we use exclusive range for token's raw.
         let lexeme = self.create_lexeme_with_raw_exclusive(
             context.previously_consumed_byte_count,

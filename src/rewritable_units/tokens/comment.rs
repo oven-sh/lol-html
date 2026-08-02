@@ -33,7 +33,7 @@ pub struct Comment<'i> {
     raw: SpannedRawBytes<'i>,
     encoding: &'static Encoding,
     mutations: Mutations,
-    user_data: Box<dyn Any>,
+    user_data: Box<dyn Any + Send>,
 }
 
 impl<'i> Comment<'i> {
@@ -240,6 +240,19 @@ impl<'i> Comment<'i> {
     #[must_use]
     pub fn removed(&self) -> bool {
         self.mutations.removed()
+    }
+
+    /// Detaches the comment from the parser's input buffer so it can outlive
+    /// the current `write()` call (handler suspension). Leaves `self` behind
+    /// in a drained state; the caller abandons it.
+    pub(crate) fn take_owned(&mut self) -> Comment<'static> {
+        Comment {
+            text: self.text.take_owned(),
+            raw: self.raw.take_owned(),
+            encoding: self.encoding,
+            mutations: std::mem::replace(&mut self.mutations, Mutations::new()),
+            user_data: std::mem::replace(&mut self.user_data, Box::new(())),
+        }
     }
 
     #[inline]

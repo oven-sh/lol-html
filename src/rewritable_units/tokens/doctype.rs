@@ -1,5 +1,5 @@
 use crate::base::Bytes;
-use crate::base::Spanned;
+use crate::base::{BytesCow, Spanned, SpannedRawBytes};
 use crate::errors::RewritingError;
 use crate::html_content::SourceLocation;
 use crate::rewritable_units::{Serialize, Token};
@@ -35,14 +35,14 @@ use std::fmt::{self, Debug};
 ///
 /// [document type declaration]: https://developer.mozilla.org/en-US/docs/Glossary/Doctype
 pub struct Doctype<'i> {
-    name: Option<Bytes<'i>>,
-    public_id: Option<Bytes<'i>>,
-    system_id: Option<Bytes<'i>>,
+    name: Option<BytesCow<'i>>,
+    public_id: Option<BytesCow<'i>>,
+    system_id: Option<BytesCow<'i>>,
     force_quirks: bool,
     removed: bool,
-    raw: Spanned<Bytes<'i>>,
+    raw: SpannedRawBytes<'i>,
     encoding: &'static Encoding,
-    user_data: Box<dyn Any>,
+    user_data: Box<dyn Any + Send>,
 }
 
 impl<'i> Doctype<'i> {
@@ -58,15 +58,31 @@ impl<'i> Doctype<'i> {
         encoding: &'static Encoding,
     ) -> Token<'i> {
         Token::Doctype(Doctype {
-            name,
-            public_id,
-            system_id,
+            name: name.map(Into::into),
+            public_id: public_id.map(Into::into),
+            system_id: system_id.map(Into::into),
             force_quirks,
             removed,
-            raw,
+            raw: raw.into(),
             encoding,
             user_data: Box::new(()),
         })
+    }
+
+    /// Detaches the doctype from the parser's input buffer so it can outlive
+    /// the current `write()` call (handler suspension). Leaves `self` behind
+    /// in a drained state; the caller abandons it.
+    pub(crate) fn take_owned(&mut self) -> Doctype<'static> {
+        Doctype {
+            name: self.name.as_mut().map(BytesCow::take_owned),
+            public_id: self.public_id.as_mut().map(BytesCow::take_owned),
+            system_id: self.system_id.as_mut().map(BytesCow::take_owned),
+            force_quirks: self.force_quirks,
+            removed: self.removed,
+            raw: self.raw.take_owned(),
+            encoding: self.encoding,
+            user_data: std::mem::replace(&mut self.user_data, Box::new(())),
+        }
     }
 
     /// The name of the doctype.
@@ -125,7 +141,9 @@ impl Serialize for &Doctype<'_> {
     #[inline]
     fn into_bytes(self, output_handler: &mut dyn FnMut(&[u8])) -> Result<(), RewritingError> {
         if !self.removed() {
-            output_handler(self.raw.as_slice());
+            // A doctype is never mutated, so its raw bytes are always present
+            // (`Original` from the lexeme, or `Owned` after a suspension).
+            output_handler(self.raw.original().unwrap_or_default());
         }
         Ok(())
     }

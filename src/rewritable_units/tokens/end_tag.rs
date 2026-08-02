@@ -160,6 +160,18 @@ impl<'i> EndTag<'i> {
         self.mutations.removed()
     }
 
+    /// Detaches the tag from the parser's input buffer so it can outlive the
+    /// current `write()` call (handler suspension). Leaves `self` behind in a
+    /// drained state; the caller abandons it.
+    pub(crate) fn take_owned(&mut self) -> EndTag<'static> {
+        EndTag {
+            name: self.name.take_owned(),
+            raw: self.raw.take_owned(),
+            encoding: self.encoding,
+            mutations: std::mem::replace(&mut self.mutations, Mutations::new()),
+        }
+    }
+
     #[inline]
     fn serialize_self(&self, sink: &mut StreamingHandlerSink<'_>) -> Result<(), RewritingError> {
         let output_handler = sink.output_handler();
