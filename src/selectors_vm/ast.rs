@@ -1,11 +1,12 @@
 use super::parser::{Selector, SelectorImplDescriptor};
-use hashbrown::{DefaultHashBuilder, HashSet};
+use hashbrown::{DefaultHashBuilder, HashSet, HashTable};
 use selectors::attr::{AttrSelectorOperator, ParsedCaseSensitivity};
 use selectors::parser::{Combinator, Component, NthType};
 use std::fmt::{self, Debug, Formatter};
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash, Hasher};
+use std::mem::discriminant;
 
-#[derive(PartialEq, Eq, Debug, Copy, Clone)]
+#[derive(PartialEq, Eq, Hash, Debug, Copy, Clone)]
 pub(crate) struct NthChild {
     step: i32,
     offset: i32,
@@ -38,7 +39,7 @@ impl NthChild {
     }
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Hash, Debug)]
 pub(crate) enum OnTagNameExpr {
     ExplicitAny,
     Unmatchable,
@@ -73,6 +74,18 @@ impl AttributeComparisonExpr {
     }
 }
 
+// `ParsedCaseSensitivity` and `AttrSelectorOperator` are fieldless enums
+// without a `Hash` impl, so their discriminant stands in. It agrees with
+// the derived `PartialEq`.
+impl Hash for AttributeComparisonExpr {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.value.hash(state);
+        discriminant(&self.case_sensitivity).hash(state);
+        discriminant(&self.operator).hash(state);
+    }
+}
+
 impl Debug for AttributeComparisonExpr {
     #[cold]
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -96,7 +109,7 @@ impl Debug for AttributeComparisonExpr {
 }
 
 /// An attribute check when attributes are received and parsed.
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Hash, Debug)]
 pub(crate) enum OnAttributesExpr {
     Id(Box<str>),
     Class(Box<str>),
@@ -161,7 +174,7 @@ impl From<&Component<SelectorImplDescriptor>> for Condition {
     }
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Hash, Debug)]
 pub(crate) struct Expr<E>
 where
     E: PartialEq + Eq + Debug,
@@ -183,7 +196,7 @@ where
     }
 }
 
-#[derive(PartialEq, Eq, Debug, Default)]
+#[derive(PartialEq, Eq, Hash, Debug, Default)]
 pub(crate) struct Predicate {
     pub on_tag_name_exprs: Vec<Expr<OnTagNameExpr>>,
     pub on_attr_exprs: Vec<Expr<OnAttributesExpr>>,
@@ -234,6 +247,48 @@ where
     }
 }
 
+/// Locates the node with a given predicate among the siblings of one branch
+/// vector, so `add_selector` does not scan every sibling for every selector.
+/// Entries point into the tree by (branch, index). A branch is identified by
+/// the id of the node that owns it, see `Ast::branch_id`.
+struct IndexEntry {
+    hash: u64,
+    branch: usize,
+    node_idx: usize,
+    node_id: usize,
+}
+
+/// Build-time lookup table for `Ast::add_selector`. It is derived from the
+/// tree, so it takes no part in equality or debug output. It hashes with its
+/// own state: callers may pass a different `hasher` to each `add_selector`.
+#[derive(Default)]
+struct NodeIndex {
+    table: HashTable<IndexEntry>,
+    hasher: DefaultHashBuilder,
+}
+
+impl PartialEq for NodeIndex {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for NodeIndex {}
+
+impl Debug for NodeIndex {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("NodeIndex")
+    }
+}
+
+const ROOT_BRANCH: usize = 0;
+
+#[derive(Clone, Copy)]
+enum BranchKind {
+    Children = 1,
+    Descendants = 2,
+}
+
 // exposed for selectors_ast tool
 #[derive(Default, PartialEq, Eq, Debug)]
 pub struct Ast<P>
@@ -243,47 +298,85 @@ where
     pub(crate) root: Vec<AstNode<P>>,
     // NOTE: used to preallocate instruction vector during compilation.
     pub(crate) cumulative_node_count: usize,
+    node_index: NodeIndex,
 }
 
 impl<P> Ast<P>
 where
     P: PartialEq + Eq + Copy + Debug + Hash,
 {
+    /// Node ids start at 1 (`cumulative_node_count` after the push), so a
+    /// node's branches never collide with `ROOT_BRANCH`.
+    #[inline]
+    const fn branch_id(node_id: usize, kind: BranchKind) -> usize {
+        node_id * 2 + kind as usize - 1
+    }
+
+    /// Returns the index of the node with `predicate` in `branches`, and the
+    /// node's id. The node is created when it does not exist yet.
     #[inline]
     fn host_expressions(
         predicate: Predicate,
+        branch: usize,
         branches: &mut Vec<AstNode<P>>,
+        node_index: &mut NodeIndex,
         cumulative_node_count: &mut usize,
         hasher: DefaultHashBuilder,
-    ) -> usize {
-        branches
-            .iter()
-            .enumerate()
-            .find(|(_, n)| n.predicate == predicate)
-            .map(|(i, _)| i)
-            .unwrap_or_else(move || {
-                branches.push(AstNode::new(predicate, hasher));
-                *cumulative_node_count += 1;
+    ) -> (usize, usize) {
+        let hash = {
+            let mut state = node_index.hasher.build_hasher();
+            branch.hash(&mut state);
+            predicate.hash(&mut state);
+            state.finish()
+        };
 
-                branches.len() - 1
-            })
+        let existing = node_index.table.find(hash, |e| {
+            e.branch == branch && branches[e.node_idx].predicate == predicate
+        });
+
+        if let Some(e) = existing {
+            return (e.node_idx, e.node_id);
+        }
+
+        branches.push(AstNode::new(predicate, hasher));
+        *cumulative_node_count += 1;
+
+        let node_idx = branches.len() - 1;
+        let node_id = *cumulative_node_count;
+
+        node_index.table.insert_unique(
+            hash,
+            IndexEntry {
+                hash,
+                branch,
+                node_idx,
+                node_id,
+            },
+            |e| e.hash,
+        );
+
+        (node_idx, node_id)
     }
 
     pub fn add_selector(&mut self, selector: &Selector, payload: P, hasher: DefaultHashBuilder) {
         for selector_item in (selector.0).slice() {
             let mut predicate = Predicate::default();
             let mut branches = &mut self.root;
+            let mut branch = ROOT_BRANCH;
 
             macro_rules! host_and_switch_branch_vec {
-                ($branches:ident) => {{
-                    let node_idx = Self::host_expressions(
+                ($branches:ident, $kind:expr) => {{
+                    let (node_idx, node_id) = Self::host_expressions(
                         predicate,
+                        branch,
                         branches,
+                        &mut self.node_index,
                         &mut self.cumulative_node_count,
                         hasher.clone(),
                     );
 
                     branches = &mut branches[node_idx].$branches;
+                    branch = Self::branch_id(node_id, $kind);
                     predicate = Predicate::default();
                 }};
             }
@@ -291,10 +384,10 @@ where
             for component in selector_item.iter_raw_parse_order_from(0) {
                 match component {
                     Component::Combinator(Combinator::Child) => {
-                        host_and_switch_branch_vec!(children);
+                        host_and_switch_branch_vec!(children, BranchKind::Children);
                     }
                     Component::Combinator(Combinator::Descendant) => {
-                        host_and_switch_branch_vec!(descendants);
+                        host_and_switch_branch_vec!(descendants, BranchKind::Descendants);
                     }
                     Component::Negation(ss) => {
                         ss.slice()
@@ -305,9 +398,11 @@ where
                 }
             }
 
-            let node_idx = Self::host_expressions(
+            let (node_idx, _) = Self::host_expressions(
                 predicate,
+                branch,
                 branches,
+                &mut self.node_index,
                 &mut self.cumulative_node_count,
                 hasher.clone(),
             );
@@ -382,6 +477,7 @@ mod tests {
                         payload: set![0],
                     }],
                     cumulative_node_count: 1,
+                    ..Default::default()
                 },
             );
         }
@@ -537,6 +633,7 @@ mod tests {
                         payload: set![0],
                     }],
                     cumulative_node_count: 1,
+                    ..Default::default()
                 },
             );
         }
@@ -573,6 +670,7 @@ mod tests {
                     payload: set![0],
                 }],
                 cumulative_node_count: 1,
+                ..Default::default()
             },
         );
     }
@@ -595,8 +693,34 @@ mod tests {
                     payload: set![0, 1],
                 }],
                 cumulative_node_count: 1,
+                ..Default::default()
             },
         );
+    }
+
+    #[test]
+    fn many_distinct_selectors() {
+        let mut ast = Ast::default();
+        let n = 50_000;
+
+        for i in 0..n {
+            let selector = format!("div.c{i} > p.d{i}");
+            ast.add_selector(&selector.parse().unwrap(), i, Default::default());
+        }
+
+        // The same selectors again, with the same payloads, change nothing.
+        for i in 0..n {
+            let selector = format!("div.c{i} > p.d{i}");
+            ast.add_selector(&selector.parse().unwrap(), i, Default::default());
+        }
+
+        assert_eq!(ast.root.len(), n);
+        assert_eq!(ast.cumulative_node_count, 2 * n);
+
+        for (i, node) in ast.root.iter().enumerate() {
+            assert_eq!(node.children.len(), 1);
+            assert_eq!(node.children[0].payload, set![i]);
+        }
     }
 
     #[test]
@@ -666,6 +790,7 @@ mod tests {
                     payload: set![],
                 }],
                 cumulative_node_count: 5,
+                ..Default::default()
             },
         );
     }
@@ -810,6 +935,7 @@ mod tests {
                     },
                 ],
                 cumulative_node_count: 10,
+                ..Default::default()
             },
         );
     }
