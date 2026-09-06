@@ -11,6 +11,7 @@ use selectors::attr::{AttrSelectorOperator, ParsedCaseSensitivity};
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::iter;
+use std::mem;
 
 type BytesOwned = Box<[u8]>;
 
@@ -260,18 +261,17 @@ where
     }
 
     #[inline]
-    fn compile_descendants(
-        &mut self,
-        nodes: Vec<AstNode<P>>,
-        enable_nth_of_type: &mut bool,
-    ) -> Option<AddressRange> {
+    fn reserve_descendants(&mut self, nodes: &[AstNode<P>]) -> Option<AddressRange> {
         if nodes.is_empty() {
             None
         } else {
-            Some(self.compile_nodes(nodes, enable_nth_of_type))
+            Some(self.reserve(nodes))
         }
     }
 
+    /// Compiles the node tree breadth-first with an explicit work list, so the
+    /// native stack depth does not grow with the number of combinators in a
+    /// selector (`a b c ...` builds a chain one node deep per combinator).
     fn compile_nodes(
         &mut self,
         nodes: Vec<AstNode<P>>,
@@ -280,16 +280,30 @@ where
         // NOTE: we need sibling nodes to be in a contiguous region, so
         // we can reference them by range instead of vector of addresses.
         let addr_range = self.reserve(&nodes);
+        let mut pending = vec![(nodes, addr_range.clone())];
 
-        for (node, position) in nodes.into_iter().zip(addr_range.clone()) {
-            let branch = ExecutionBranch {
-                matched_payload: node.payload,
-                jumps: self.compile_descendants(node.children, enable_nth_of_type),
-                hereditary_jumps: self.compile_descendants(node.descendants, enable_nth_of_type),
-            };
+        while let Some((nodes, range)) = pending.pop() {
+            for (mut node, position) in nodes.into_iter().zip(range) {
+                let jumps = self.reserve_descendants(&node.children);
+                let hereditary_jumps = self.reserve_descendants(&node.descendants);
 
-            self.instructions[position] =
-                Some(self.compile_predicate(&node.predicate, branch, enable_nth_of_type));
+                let branch = ExecutionBranch {
+                    matched_payload: mem::take(&mut node.payload),
+                    jumps: jumps.clone(),
+                    hereditary_jumps: hereditary_jumps.clone(),
+                };
+
+                self.instructions[position] =
+                    Some(self.compile_predicate(&node.predicate, branch, enable_nth_of_type));
+
+                if let Some(range) = jumps {
+                    pending.push((mem::take(&mut node.children), range));
+                }
+
+                if let Some(range) = hereditary_jumps {
+                    pending.push((mem::take(&mut node.descendants), range));
+                }
+            }
         }
 
         addr_range
@@ -937,6 +951,25 @@ mod tests {
                     ("<span lang='en-GB'", false),
                 ],
             );
+        }
+    }
+
+    #[test]
+    fn deep_combinator_chain() {
+        // Native stack usage must not grow with the combinator count.
+        const DEPTH: usize = 100_000;
+
+        for combinator in [" ", " > "] {
+            let selector = vec!["p"; DEPTH].join(combinator);
+            let program = test_compile(&[&selector], UTF_8, 1);
+
+            assert_eq!(program.instructions.len(), DEPTH);
+
+            // An AST that is built and then dropped without compilation
+            // must not recurse either.
+            let mut ast = Ast::default();
+            ast.add_selector(&selector.parse().unwrap(), 0, Default::default());
+            drop(ast);
         }
     }
 

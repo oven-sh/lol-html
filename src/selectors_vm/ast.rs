@@ -234,6 +234,29 @@ where
     }
 }
 
+/// The derived drop glue recurses once per tree level, and a selector chain
+/// like `a b c ...` is one level deep per combinator. Flatten the subtree into
+/// a work list first so that the recursion never happens.
+impl<P> Drop for AstNode<P>
+where
+    P: Hash + Eq,
+{
+    fn drop(&mut self) {
+        if self.children.is_empty() && self.descendants.is_empty() {
+            return;
+        }
+
+        let mut pending = Vec::new();
+        pending.append(&mut self.children);
+        pending.append(&mut self.descendants);
+
+        while let Some(mut node) = pending.pop() {
+            pending.append(&mut node.children);
+            pending.append(&mut node.descendants);
+        }
+    }
+}
+
 // exposed for selectors_ast tool
 #[derive(Default, PartialEq, Eq, Debug)]
 pub struct Ast<P>
