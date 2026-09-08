@@ -492,7 +492,7 @@ macro_rules! text {
         #[inline(always)]
         fn type_hint<T>(h: T) -> T
         where
-            T: FnMut(&mut $crate::html_content::TextChunk) -> $crate::HandlerResult,
+            T: FnMut(&mut $crate::html_content::TextChunk<'_>) -> $crate::HandlerResult,
         {
             h
         }
