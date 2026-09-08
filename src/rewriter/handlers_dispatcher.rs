@@ -157,6 +157,11 @@ impl<H> HandlerVec<H> {
         mut cb: impl FnMut(H) -> HandlerResult,
     ) -> HandlerResult {
         for i in (0..self.items.len()).rev() {
+            // Active items are always a suffix (see `end_tag_handler_idx`),
+            // so once the active count is spent nothing below can match.
+            if self.user_count == 0 {
+                break;
+            }
             if self.items[i].user_count > 0 {
                 let item = self.items.remove(i);
 
