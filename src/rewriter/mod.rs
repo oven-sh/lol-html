@@ -1126,7 +1126,7 @@ mod tests {
     /// Content-handler suspension (see [`SuspensionRequest`]).
     mod suspension {
         use super::*;
-        use std::cell::{Cell, RefCell};
+        use std::cell::RefCell;
         use std::rc::Rc;
 
         type TestSink = Box<dyn FnMut(&[u8])>;

@@ -508,13 +508,7 @@ where
         let active = self.stack.active_hereditary_jumps();
 
         if let Some((ptr_jumps, _)) = active.get(ptr.instr_set_idx) {
-            self.exec_instr_set_with_attrs(
-                ptr_jumps,
-                attr_matcher,
-                ctx,
-                ptr.offset,
-                match_handler,
-            );
+            self.exec_instr_set_with_attrs(ptr_jumps, attr_matcher, ctx, ptr.offset, match_handler);
 
             for (jumps, _) in active.iter().skip(ptr.instr_set_idx + 1) {
                 self.exec_instr_set_with_attrs(jumps, attr_matcher, ctx, 0, match_handler);
