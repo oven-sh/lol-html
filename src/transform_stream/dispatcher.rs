@@ -63,6 +63,20 @@ pub trait TransformController: Sized {
     /// return `false` throughout and skip serialization entirely.
     fn should_emit_content(&self) -> bool;
 
+    /// A run of text, as the undecoded bytes of the input it spans, when
+    /// [`TokenCaptureFlags::RAW_TEXT`] is in effect. A text node may arrive
+    /// as several runs (the tokenizer splits at input chunk boundaries and
+    /// around constructs it has to inspect); its end is implied by the next
+    /// tag, comment, doctype or the end of input. The bytes are in the
+    /// stream's encoding and are passed through to the output unchanged.
+    fn handle_raw_text(
+        &mut self,
+        _text: &[u8],
+        _text_type: TextType,
+    ) -> Result<(), RewritingError> {
+        Ok(())
+    }
+
     /// Runs the handlers that had not yet run for the token a previous
     /// `handle_token` parked (see [`RewritingError::Suspended`]) and returns
     /// the completed, owned token for serialization. May suspend again.
@@ -277,6 +291,14 @@ where
             ToTokenResult::Token(token) => {
                 self.delegate.lexeme_consumed(lexeme);
                 self.delegate.token_produced(token)?;
+            }
+            ToTokenResult::RawText(text_type) => {
+                let raw = lexeme.raw();
+                self.delegate
+                    .transform_controller
+                    .handle_raw_text(&raw, text_type)?;
+                // Not consumed as a token: the bytes stay part of the pending
+                // input slice and reach the output sink (if enabled) verbatim.
             }
             ToTokenResult::Text(text_type) => {
                 self.delegate.lexeme_consumed(lexeme);

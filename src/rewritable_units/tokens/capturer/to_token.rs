@@ -7,6 +7,9 @@ use encoding_rs::Encoding;
 pub(crate) enum ToTokenResult<'i> {
     Token(Token<'i>),
     Text(TextType),
+    /// `TokenCaptureFlags::RAW_TEXT`: the lexeme's bytes go to the
+    /// controller as they are.
+    RawText(TextType),
     None,
 }
 
@@ -72,6 +75,12 @@ impl ToToken for NonTagContentLexeme<'_> {
                 if capture_flags.contains(TokenCaptureFlags::TEXT) =>
             {
                 ToTokenResult::Text(*text_type)
+            }
+
+            Some(NonTagContentTokenOutline::Text(text_type))
+                if capture_flags.contains(TokenCaptureFlags::RAW_TEXT) =>
+            {
+                ToTokenResult::RawText(*text_type)
             }
 
             Some(NonTagContentTokenOutline::Comment(text))
