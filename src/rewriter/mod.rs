@@ -2273,6 +2273,42 @@ mod tests {
         }
 
         #[test]
+        fn void_element_renamed_across_suspension() {
+            // The end tag written for a renamed void element belongs to the
+            // start tag, so it has to survive the deep copy of a suspension...
+            let (out, n) = drive(
+                &["<img src=a><p>next</p>"],
+                Settings {
+                    element_content_handlers: vec![element!("img", |el: &mut Element<'_, '_>| {
+                        el.set_tag_name("picture").unwrap();
+                        el.after("!", ContentType::Text);
+                        SUSPEND()
+                    })],
+                    ..Settings::new()
+                },
+                |_| {},
+            );
+            assert_eq!(out, "<picture src=a></picture>!<p>next</p>");
+            assert_eq!(n, 1);
+
+            // ...and a rename made while suspended gets one too.
+            let (out, n) = drive(
+                &["<br><p>next</p>"],
+                Settings {
+                    element_content_handlers: vec![element!("br", |_| SUSPEND())],
+                    ..Settings::new()
+                },
+                |rewriter| {
+                    let el = rewriter.suspended_element().unwrap();
+                    assert!(!el.can_have_content());
+                    el.set_tag_name("textarea").unwrap();
+                },
+            );
+            assert_eq!(out, "<textarea></textarea><p>next</p>");
+            assert_eq!(n, 1);
+        }
+
+        #[test]
         fn end_tag_handler_suspension() {
             let (out, n) = drive(
                 &["<div>x</div>y"],
