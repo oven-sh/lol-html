@@ -1,8 +1,9 @@
 mod dispatcher;
 
+pub(crate) use self::dispatcher::AuxStartTagInfo;
 use self::dispatcher::Dispatcher;
+pub use self::dispatcher::DispatcherError;
 pub use self::dispatcher::OutputSink;
-pub(crate) use self::dispatcher::{AuxStartTagInfo, DispatcherError};
 pub use self::dispatcher::{StartTagHandlingResult, TransformController};
 use crate::base::SharedEncoding;
 use crate::memory::{Arena, SharedMemoryLimiter};
@@ -10,16 +11,25 @@ use crate::parser::{Parser, ParserDirective};
 use crate::rewriter::RewritingError;
 
 // Pub only for integration tests
+/// Construction parameters for a [`TransformStream`].
 pub struct TransformStreamSettings<C, O>
 where
     C: TransformController,
     O: OutputSink,
 {
+    /// Receives tag decisions and captured tokens.
     pub transform_controller: C,
+    /// Receives the (possibly rewritten) output; see
+    /// [`TransformController::should_emit_content`].
     pub output_sink: O,
+    /// Initial size of the buffer that holds input carried across chunks.
     pub preallocated_parsing_buffer_size: usize,
+    /// Bounds that buffer (and other per-stream allocations).
     pub memory_limiter: SharedMemoryLimiter,
+    /// Input encoding; must be ASCII-compatible.
     pub encoding: SharedEncoding,
+    /// Fail on constructs whose parsing depends on scripting/tree state the
+    /// tokenizer cannot know (see [`Settings::strict`](crate::Settings)).
     pub strict: bool,
 }
 
@@ -37,6 +47,8 @@ enum SuspendedPhase {
 }
 
 // Pub only for integration tests
+/// The streaming HTML tokenizer driving a [`TransformController`]: feed it
+/// input with [`write`](Self::write) and finish with [`end`](Self::end).
 pub struct TransformStream<C, O>
 where
     C: TransformController,
@@ -53,6 +65,7 @@ where
     C: TransformController,
     O: OutputSink,
 {
+    /// Creates a stream; nothing is parsed until [`write`](Self::write).
     pub fn new(settings: TransformStreamSettings<C, O>) -> Self {
         let initial_parser_directive = if settings
             .transform_controller
@@ -85,6 +98,14 @@ where
         }
     }
 
+    /// The transform controller this stream was created with.
+    #[inline]
+    pub fn controller(&mut self) -> &mut C {
+        self.parser.get_dispatcher().transform_controller_mut()
+    }
+
+    /// Parses the next chunk of input. Input that cannot be tokenized yet (a
+    /// tag split across chunks) is buffered until the next call.
     pub fn write(&mut self, data: &[u8]) -> Result<(), RewritingError> {
         trace!(@write data);
         debug_assert!(self.suspended == SuspendedPhase::None);
@@ -134,6 +155,8 @@ where
         Ok(())
     }
 
+    /// Declares the input complete: flushes buffered text and runs
+    /// [`TransformController::handle_end`].
     pub fn end(&mut self) -> Result<(), RewritingError> {
         trace!(@end);
         debug_assert!(self.suspended == SuspendedPhase::None);

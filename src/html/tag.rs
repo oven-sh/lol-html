@@ -3,6 +3,8 @@ macro_rules! declare_tags {
         // Pub only for integration tests
         #[repr(u64)]
         #[derive(Debug, Copy, Clone)]
+        /// The standard tag names, valued by their [`LocalNameHash`](crate::transform::LocalNameHash).
+        #[allow(missing_docs)]
         pub enum Tag {
             $($name = $val),+
         }

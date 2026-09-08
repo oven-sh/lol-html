@@ -20,27 +20,47 @@ pub(crate) struct AuxStartTagInfo<'i> {
 type AuxStartTagInfoRequest<C> =
     Box<dyn FnOnce(&mut C, AuxStartTagInfo<'_>) -> ActionResult<TokenCaptureFlags> + Send>;
 
-// Pub only for integration tests
+/// Failure (or deferral) of [`TransformController::handle_start_tag`].
 #[allow(private_interfaces)]
 pub enum DispatcherError<C> {
+    /// Used by [`HtmlRewriter`](crate::HtmlRewriter) to ask for the tag's
+    /// attributes before deciding; not constructible outside the crate.
     InfoRequest(AuxStartTagInfoRequest<C>),
+    /// Aborts the stream with this error.
     RewritingError(RewritingError),
 }
 
-// Pub only for integration tests
+/// What to capture from here on, or why not.
 pub type StartTagHandlingResult<C> = Result<TokenCaptureFlags, DispatcherError<C>>;
 
-// Pub only for integration tests
+/// The consumer side of a [`TransformStream`](crate::transform::TransformStream).
+///
+/// For every tag the stream first reports just its name (and, for start
+/// tags, namespace) — `handle_start_tag` / `handle_end_tag` — and the
+/// returned [`TokenCaptureFlags`] decide which of the following tokens are
+/// lexed in full and delivered to `handle_token`: the tag itself
+/// (`NEXT_START_TAG` / `NEXT_END_TAG`, with attributes), text, comments,
+/// doctypes. Tokens that are not captured cost nothing beyond scanning.
 pub trait TransformController: Sized {
+    /// Capture flags in effect before the first tag.
     fn initial_capture_flags(&self) -> TokenCaptureFlags;
+    /// A start tag was scanned. `name` borrows the input; keep it with
+    /// [`LocalName::into_owned`].
     fn handle_start_tag(
         &mut self,
         name: LocalName<'_>,
         ns: Namespace,
     ) -> StartTagHandlingResult<Self>;
+    /// An end tag was scanned (every end tag, matched or not).
     fn handle_end_tag(&mut self, name: LocalName<'_>) -> TokenCaptureFlags;
+    /// A captured token. Mutating it changes what is serialized to the
+    /// output sink.
     fn handle_token(&mut self, token: &mut Token<'_>) -> Result<(), RewritingError>;
+    /// End of input.
     fn handle_end(&mut self, document_end: &mut DocumentEnd<'_>) -> Result<(), RewritingError>;
+    /// Whether input and tokens should currently be written to the output
+    /// sink; re-evaluated after every tag. A controller that only reads can
+    /// return `false` throughout and skip serialization entirely.
     fn should_emit_content(&self) -> bool;
 
     /// Runs the handlers that had not yet run for the token a previous
@@ -398,7 +418,7 @@ where
 
     /// The transform controller, for reaching the parked token of a
     /// suspension from the embedder.
-    pub(crate) const fn transform_controller_mut(&mut self) -> &mut C {
+    pub const fn transform_controller_mut(&mut self) -> &mut C {
         &mut self.delegate.transform_controller
     }
 

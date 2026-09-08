@@ -31,7 +31,8 @@ use std::fmt;
 // to be able to invalidate itself if parsing an unrepresentable name.
 // `EMPTY_HASH` is used as a sentinel value.
 //
-// Pub only for integration tests
+/// A tag name of up to twelve `[a-zA-Z1-6]` characters packed five bits per
+/// character into a `u64`; compares as an integer. See the notes above.
 #[derive(PartialEq, Eq, Copy, Clone, Default, Hash)]
 pub struct LocalNameHash(u64);
 
@@ -40,18 +41,21 @@ const EMPTY_HASH: u64 = !0;
 impl LocalNameHash {
     #[inline]
     #[must_use]
+    /// The hash of the empty name.
     pub const fn new() -> Self {
         Self(0)
     }
 
     #[inline]
     #[must_use]
+    /// Whether the name was not representable (too long, or other characters).
     pub const fn is_empty(&self) -> bool {
         self.0 == EMPTY_HASH
     }
 
+    /// Appends one character.
     #[inline]
-    pub fn update(&mut self, ch: u8) {
+    pub const fn update(&mut self, ch: u8) {
         let h = self.0;
 
         // NOTE: check if we still have space for yet another
@@ -67,12 +71,12 @@ impl LocalNameHash {
                 // upper bits which we eliminate with the mask). Then add
                 // 5, since numbers from 0 to 5 are reserved for digits.
                 // Aftwerards put result as 5 lower bits of the hash.
-                b'a'..=b'z' | b'A'..=b'Z' => (h << 5) | ((u64::from(ch) & 0x1F) + 5),
+                b'a'..=b'z' | b'A'..=b'Z' => (h << 5) | ((ch as u64 & 0x1F) + 5),
 
                 // NOTE: apply 0x0F mask on ASCII digit to convert it to number
                 // from 1 to 6. Then subtract 1 to make it zero-based.
                 // Afterwards, put result as lower bits of the hash.
-                b'1'..=b'6' => (h << 5) | ((u64::from(ch) & 0x0F) - 1),
+                b'1'..=b'6' => (h << 5) | ((ch as u64 & 0x0F) - 1),
 
                 // NOTE: for any other characters hash function is not
                 // applicable, so we completely invalidate the hash.
@@ -84,18 +88,42 @@ impl LocalNameHash {
     }
 }
 
-impl fmt::Debug for LocalNameHash {
-    #[cold]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.is_empty() {
-            return f.write_str("N/A");
+impl LocalNameHash {
+    /// Hashes a complete name; usable in `const` context, e.g. to build
+    /// `match` arms over [`as_u64`](Self::as_u64) values.
+    #[must_use]
+    pub const fn from_ascii(name: &[u8]) -> Self {
+        let mut hash = Self::new();
+        let mut i = 0;
+        while i < name.len() {
+            hash.update(name[i]);
+            i += 1;
         }
+        hash
+    }
 
-        let mut reverse_buf = [0u8; 12];
-        let mut pos = 11;
+    /// The packed value (see the encoding notes above); `!0` when the name
+    /// was not representable.
+    #[inline]
+    #[must_use]
+    pub const fn as_u64(&self) -> u64 {
+        self.0
+    }
+
+    /// Unpacks the hash back into the ASCII-lowercase tag name it encodes.
+    /// The encoding is reversible for every representable name (the first
+    /// character of a tag name is always a letter, so leading zero groups are
+    /// unambiguous padding). Returns `None` for the empty/invalid hash.
+    #[inline]
+    pub fn decode<'b>(&self, buf: &'b mut [u8; 12]) -> Option<&'b str> {
+        if self.is_empty() || self.0 == 0 {
+            return None;
+        }
+        let mut pos = 12;
         let mut h = self.0;
         loop {
-            reverse_buf[pos] = match (h & 31) as u8 {
+            pos -= 1;
+            buf[pos] = match (h & 31) as u8 {
                 v @ 6.. => v + (b'a' - 6),
                 v => v + b'1',
             };
@@ -103,24 +131,27 @@ impl fmt::Debug for LocalNameHash {
             if h == 0 || pos == 0 {
                 break;
             }
-            pos -= 1;
         }
-        std::str::from_utf8(&reverse_buf[pos..])
-            .unwrap_or_default()
-            .fmt(f)
+        // Only ASCII letters and digits were written.
+        std::str::from_utf8(&buf[pos..]).ok()
+    }
+}
+
+impl fmt::Debug for LocalNameHash {
+    #[cold]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut buf = [0u8; 12];
+        match self.decode(&mut buf) {
+            Some(name) => name.fmt(f),
+            None => f.write_str("N/A"),
+        }
     }
 }
 
 impl From<&str> for LocalNameHash {
     #[inline]
     fn from(string: &str) -> Self {
-        let mut hash = Self::new();
-
-        for ch in string.bytes() {
-            hash.update(ch);
-        }
-
-        hash
+        Self::from_ascii(string.as_bytes())
     }
 }
 
@@ -136,7 +167,9 @@ impl PartialEq<Tag> for LocalNameHash {
 /// non-standard tag names it fallsback to the Name representation.
 #[derive(Clone, Debug, Eq)]
 pub enum LocalName<'i> {
+    /// A name representable as a [`LocalNameHash`].
     Hash(LocalNameHash),
+    /// Any other name, as written (compared ASCII case-insensitively).
     Bytes(BytesCow<'i>),
 }
 
@@ -165,6 +198,7 @@ impl<'i> LocalName<'i> {
 
     #[inline]
     #[must_use]
+    /// Detaches the name from the input buffer.
     pub fn into_owned(self) -> LocalName<'static> {
         match self {
             LocalName::Bytes(b) => LocalName::Bytes(b.into_owned()),
@@ -173,6 +207,8 @@ impl<'i> LocalName<'i> {
     }
 
     #[inline]
+    /// Builds a name for comparison; fails if `string` is not representable
+    /// in `encoding`.
     pub fn from_str_without_replacements<'s>(
         string: &'s str,
         encoding: &'static Encoding,

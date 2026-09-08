@@ -200,6 +200,30 @@ pub mod test_utils {
     }
 }
 
+/// The streaming layer underneath [`HtmlRewriter`]: a [`TransformStream`]
+/// drives the tokenizer over input chunks and reports start tags, end tags
+/// and (on request) fully lexed tokens to a [`TransformController`], with no
+/// selector matching, handler dispatch or per-element allocation in between.
+///
+/// This is the interface `HtmlRewriter` itself is built on. It is exposed for
+/// consumers that need every tag and text event at tokenizer cost (Bun's
+/// HTML-to-Markdown converter builds its DOM on it); it is lower level and
+/// less stable than the rewriter API.
+///
+/// [`HtmlRewriter`]: crate::HtmlRewriter
+/// [`TransformStream`]: crate::transform::TransformStream
+/// [`TransformController`]: crate::transform::TransformController
+pub mod transform {
+    pub use crate::base::SharedEncoding;
+    pub use crate::html::{LocalName, LocalNameHash, Namespace, Tag};
+    pub use crate::memory::SharedMemoryLimiter;
+    pub use crate::rewritable_units::{DocumentEnd, Serialize, Token, TokenCaptureFlags};
+    pub use crate::transform_stream::{
+        DispatcherError, OutputSink, StartTagHandlingResult, TransformController, TransformStream,
+        TransformStreamSettings,
+    };
+}
+
 cfg_if! {
     if #[cfg(feature = "integration_test")] {
         pub mod selectors_vm;
