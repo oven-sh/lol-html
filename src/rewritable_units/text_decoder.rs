@@ -8,6 +8,10 @@ pub(crate) struct TextDecoder {
     encoding: SharedEncoding,
     pending_source_location_bytes_start: usize,
     pending_text_streaming_decoder: Option<Decoder>,
+    /// A text node is open and everything fed so far went out through the
+    /// UTF-8 fast path, so no streaming decoder exists for it. The final
+    /// (empty, `last_in_text_node`) chunk is still owed.
+    pending_utf8_text_node: bool,
     text_buffer: String,
     /// Where the current `feed_text` call was when a text handler suspended
     /// (`None` otherwise). Recorded *only* on the error path so the success
@@ -40,6 +44,7 @@ impl TextDecoder {
             pending_source_location_bytes_start: 0,
             encoding,
             pending_text_streaming_decoder: None,
+            pending_utf8_text_node: false,
             // this will be later initialized to DEFAULT_BUFFER_LEN,
             // because encoding_rs wants a slice
             text_buffer: String::new(),
@@ -52,7 +57,7 @@ impl TextDecoder {
         &mut self,
         output_handler: &mut OutputHandlerCallback<'_>,
     ) -> Result<(), RewritingError> {
-        if self.pending_text_streaming_decoder.is_some() {
+        if self.pending_text_streaming_decoder.is_some() || self.pending_utf8_text_node {
             self.feed_text(
                 Spanned::new(self.pending_source_location_bytes_start, Bytes::new(&[])),
                 true,
@@ -104,6 +109,10 @@ impl TextDecoder {
     ) -> Result<(), RewritingError> {
         let mut raw_input = input_span.as_slice();
         let mut next_source_location_bytes_start = input_span.source_location().bytes().start;
+        // Consumed here; set again below only if this feed, too, leaves a
+        // clean UTF-8 node open. (Cleared before any handler runs so that a
+        // handler suspending on the closing chunk is not handed it again.)
+        self.pending_utf8_text_node = false;
 
         let encoding = self.encoding.get();
 
@@ -130,6 +139,15 @@ impl TextDecoder {
                 debug_assert!(self.pending_text_streaming_decoder.is_none());
                 return Ok(());
             }
+            if rest.is_empty() {
+                // All of it was valid UTF-8: no decoder state to carry, only
+                // the node's closing chunk once the next non-text token (or
+                // more text) arrives. Skipping the decoder loop here keeps the
+                // fast path open for the rest of the node, too.
+                self.pending_utf8_text_node = true;
+                self.pending_source_location_bytes_start = next_source_location_bytes_start;
+                return Ok(());
+            }
         }
 
         self.feed_decoder_loop(
@@ -150,6 +168,7 @@ impl TextDecoder {
         output_handler: &mut OutputHandlerCallback<'_>,
     ) -> Result<(), RewritingError> {
         let encoding = self.encoding.get();
+        debug_assert!(!self.pending_utf8_text_node);
 
         if self.pending_text_streaming_decoder.is_none() && self.text_buffer.is_empty() {
             // repeat() avoids utf8 check comapred to `String::from_utf8(vec![0; len])`
