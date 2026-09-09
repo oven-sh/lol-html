@@ -62,7 +62,7 @@ pub unsafe extern "C" fn lol_html_comment_user_data_set(
     comment: *mut Comment,
     user_data: *mut c_void,
 ) {
-    to_ref_mut!(comment).set_user_data(user_data);
+    to_ref_mut!(comment).set_user_data(crate::UserDataPtr(user_data));
 }
 
 #[unsafe(no_mangle)]

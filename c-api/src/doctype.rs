@@ -20,7 +20,7 @@ pub unsafe extern "C" fn lol_html_doctype_user_data_set(
     doctype: *mut Doctype,
     user_data: *mut c_void,
 ) {
-    to_ref_mut!(doctype).set_user_data(user_data);
+    to_ref_mut!(doctype).set_user_data(crate::UserDataPtr(user_data));
 }
 
 #[unsafe(no_mangle)]
