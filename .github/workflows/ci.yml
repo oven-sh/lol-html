@@ -50,6 +50,11 @@ jobs:
       - name: Check docs
         run: cargo doc --no-deps --all --target-dir=target
       - name: Check semver
+        # Compares against the crates.io release of the same version; the
+        # bun branch deliberately carries API additions (suspension,
+        # lol_html::transform) on top of it and is never published, so this
+        # only makes sense upstream.
+        if: github.repository == 'cloudflare/lol-html'
         uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2
         with:
           package: lol_html
