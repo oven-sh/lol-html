@@ -281,7 +281,7 @@ pub unsafe extern "C" fn lol_html_element_user_data_set(
     element: *mut Element,
     user_data: *mut c_void,
 ) {
-    to_ref_mut!(element).set_user_data(crate::UserDataPtr(user_data));
+    to_ref_mut!(element).set_user_data(user_data);
 }
 
 /// Returns user data attached to the element.

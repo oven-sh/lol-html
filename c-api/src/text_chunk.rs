@@ -75,7 +75,7 @@ pub unsafe extern "C" fn lol_html_text_chunk_user_data_set(
     chunk: *mut TextChunk,
     user_data: *mut c_void,
 ) {
-    to_ref_mut!(chunk).set_user_data(crate::UserDataPtr(user_data));
+    to_ref_mut!(chunk).set_user_data(user_data);
 }
 
 /// Returns user data attached to the text chunk.

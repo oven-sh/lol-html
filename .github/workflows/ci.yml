@@ -17,16 +17,16 @@ jobs:
     name: Clippy and format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4
         with:
           submodules: 'recursive'
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - name: Check format
         run: cargo fmt -- --check
       - name: Cache cargo registry
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@v4
         with:
           key: index-${{ hashFiles('Cargo.toml') }}
           path: |
@@ -35,7 +35,7 @@ jobs:
       - name: Fetch dependencies
         run: cargo fetch
       - name: Cache target directory
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@v4
         with:
           key: clippy-${{ hashFiles('Cargo.lock') }}
           path: target
@@ -50,12 +50,7 @@ jobs:
       - name: Check docs
         run: cargo doc --no-deps --all --target-dir=target
       - name: Check semver
-        # Compares against the crates.io release of the same version; the
-        # bun branch deliberately carries API additions (suspension,
-        # lol_html::transform) on top of it and is never published, so this
-        # only makes sense upstream.
-        if: github.repository == 'cloudflare/lol-html'
-        uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2
+        uses: obi1kenobi/cargo-semver-checks-action@v2
         with:
           package: lol_html
           feature-group: default-features
@@ -64,12 +59,12 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4
         with:
           submodules: 'recursive'
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo registry
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@v4
         with:
           key: index-${{ hashFiles('Cargo.toml') }}
           path: |
@@ -78,13 +73,13 @@ jobs:
       - name: Fetch dependencies
         run: cargo fetch
       - name: Cache target directory
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@v4
         with:
           key: target-${{ hashFiles('Cargo.lock') }}
           path: target
       - name: Run Rust tests
         run: scripts/test.sh
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@v4
       - name: wasm-pack install
         run: npm i -g wasm-pack
       - name: Run JS tests
