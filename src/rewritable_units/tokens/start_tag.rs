@@ -97,6 +97,17 @@ impl<'input_token> StartTag<'input_token> {
         self.attributes.to_slice()
     }
 
+    /// Visits each attribute as raw `(name, value)` bytes from the input (in
+    /// the document's encoding, name not lowercased, value not decoded)
+    /// without building the [`Attribute`] list. `f` returning `false` stops
+    /// the walk. Returns `false` if the attributes have been modified through
+    /// this tag, in which case nothing is visited and
+    /// [`attributes()`](Self::attributes) should be used.
+    #[inline]
+    pub fn for_each_raw_attribute(&self, f: impl FnMut(&[u8], &[u8]) -> bool) -> bool {
+        self.attributes.for_each_raw(f)
+    }
+
     /// Sets `value` of tag's attribute with `name`. The value may have HTML/XML entities.
     ///
     /// `"` will be entity-escaped if needed. `&` won't be escaped.

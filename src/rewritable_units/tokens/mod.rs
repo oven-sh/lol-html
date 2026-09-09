@@ -9,7 +9,9 @@ pub use self::attributes::{Attribute, AttributeNameError};
 pub use self::capturer::*;
 
 // Pub only for integration tests
+/// Writes a token back out as markup, including any mutations made to it.
 pub trait Serialize {
+    /// Passes the serialized bytes to `output_handler`, possibly in pieces.
     fn into_bytes(self, output_handler: &mut dyn FnMut(&[u8])) -> Result<(), RewritingError>;
 }
 
@@ -65,7 +67,12 @@ pub use self::end_tag::EndTag;
 pub use self::start_tag::StartTag;
 pub use self::text_chunk::TextChunk;
 
-// Pub only for integration tests
+/// A fully lexed token, delivered to [`TransformController::handle_token`]
+/// for the token kinds requested through [`TokenCaptureFlags`].
+///
+/// [`TransformController::handle_token`]: crate::transform::TransformController::handle_token
+/// [`TokenCaptureFlags`]: crate::transform::TokenCaptureFlags
+#[allow(missing_docs)]
 #[derive(Debug)]
 pub enum Token<'i> {
     TextChunk(TextChunk<'i>),

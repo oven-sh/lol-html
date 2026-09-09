@@ -12,6 +12,8 @@ pub struct MemoryLimitExceededError;
 
 // Pub only for integration tests
 #[derive(Debug, Clone)]
+/// Tracks the buffer memory a stream uses against a maximum
+/// ([`MemorySettings::max_allowed_memory_usage`](crate::MemorySettings)).
 pub struct SharedMemoryLimiter {
     current_usage: Arc<AtomicUsize>,
     max: usize,
@@ -19,6 +21,7 @@ pub struct SharedMemoryLimiter {
 
 impl SharedMemoryLimiter {
     #[must_use]
+    /// A limiter allowing `max` bytes in total.
     pub fn new(max: usize) -> Self {
         Self {
             current_usage: Arc::new(AtomicUsize::new(0)),
@@ -33,6 +36,7 @@ impl SharedMemoryLimiter {
     }
 
     #[inline]
+    /// Accounts for `byte_count` more bytes, failing if that exceeds the maximum.
     pub fn increase_usage(&self, byte_count: usize) -> Result<(), MemoryLimitExceededError> {
         let previous_usage = self.current_usage.fetch_add(byte_count, Ordering::Relaxed);
         let current_usage = previous_usage + byte_count;
@@ -45,6 +49,7 @@ impl SharedMemoryLimiter {
     }
 
     #[inline]
+    /// Releases `byte_count` bytes.
     pub fn decrease_usage(&self, byte_count: usize) {
         self.current_usage.fetch_sub(byte_count, Ordering::Relaxed);
     }

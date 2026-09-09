@@ -130,6 +130,23 @@ impl<'i> Attribute<'i> {
         self.value.as_string(self.encoding)
     }
 
+    /// The name's bytes in the document's encoding, as written (not
+    /// lowercased). For ASCII-compatible encodings this allows comparing
+    /// against an ASCII name without allocating.
+    #[inline]
+    #[must_use]
+    pub fn name_raw(&self) -> &[u8] {
+        &self.name
+    }
+
+    /// The value's bytes in the document's encoding, as written (character
+    /// references not decoded).
+    #[inline]
+    #[must_use]
+    pub fn value_raw(&self) -> &[u8] {
+        &self.value
+    }
+
     #[inline]
     fn set_value(&mut self, value: &str) {
         self.value = BytesCow::from_str(value, self.encoding).into_owned();
@@ -222,6 +239,26 @@ impl<'i> Attributes<'i> {
         }
 
         false
+    }
+
+    /// Visits each attribute as `(name, value)` byte slices straight from
+    /// the input — nothing decoded or lowercased, and without materializing
+    /// the [`Attribute`] list. Stops early when `f` returns `false`. Returns
+    /// `false` itself if the attributes were already modified (the raw view
+    /// is then stale; use the item list).
+    #[inline]
+    pub fn for_each_raw(&self, mut f: impl FnMut(&[u8], &[u8]) -> bool) -> bool {
+        if self.items.get().is_some() {
+            return false;
+        }
+        for a in self.attribute_buffer.iter() {
+            let name = self.input.opt_slice(Some(a.name)).unwrap_or_default();
+            let value = self.input.opt_slice(Some(a.value)).unwrap_or_default();
+            if !f(&name, &value) {
+                break;
+            }
+        }
+        true
     }
 
     pub fn is_empty(&self) -> bool {

@@ -1,5 +1,7 @@
 // Pub only for integration tests
 #[derive(Default, Copy, Clone, Eq, PartialEq, Debug)]
+/// Element namespace, as tracked by the tree builder simulation.
+#[allow(missing_docs)]
 pub enum Namespace {
     #[default]
     Html = 0,
@@ -10,6 +12,7 @@ pub enum Namespace {
 impl Namespace {
     #[inline]
     #[must_use]
+    /// The namespace URI.
     pub const fn uri(self) -> &'static str {
         use Namespace::{Html, MathML, Svg};
 
@@ -23,6 +26,7 @@ impl Namespace {
 
     #[inline]
     #[must_use]
+    /// The namespace URI as a C string.
     pub const fn uri_c_str(self) -> &'static std::ffi::CStr {
         use Namespace::{Html, MathML, Svg};
 

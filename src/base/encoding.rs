@@ -67,6 +67,8 @@ fn encoding_to_index(encoding: AsciiCompatibleEncoding) -> usize {
 /// encounters a `meta` tag that specifies the charset (that behavior is dependent on
 /// [`crate::Settings::adjust_charset_on_meta_tag`]).
 // Pub only for integration tests
+/// An encoding handle shared by a [`TransformStream`](crate::transform::TransformStream)
+/// and the tokens it produces; it can change mid-document.
 #[derive(Clone)]
 pub struct SharedEncoding {
     encoding: Arc<AtomicUsize>,
@@ -75,6 +77,7 @@ pub struct SharedEncoding {
 impl SharedEncoding {
     #[must_use]
     #[cfg_attr(debug_assertions, track_caller)]
+    /// Wraps `encoding` for sharing between the stream and its tokens.
     pub fn new(encoding: AsciiCompatibleEncoding) -> Self {
         Self {
             encoding: Arc::new(AtomicUsize::new(encoding_to_index(encoding))),
@@ -82,6 +85,7 @@ impl SharedEncoding {
     }
 
     #[must_use]
+    /// The current encoding.
     pub fn get(&self) -> &'static Encoding {
         let encoding = self.encoding.load(Ordering::Relaxed);
         // it will never be out of range, but get() avoids a panic branch
@@ -89,6 +93,7 @@ impl SharedEncoding {
     }
 
     #[cfg_attr(debug_assertions, track_caller)]
+    /// Switches the encoding (a `<meta charset>` was seen).
     pub fn set(&self, encoding: AsciiCompatibleEncoding) {
         self.encoding
             .store(encoding_to_index(encoding), Ordering::Relaxed);
