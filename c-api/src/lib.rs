@@ -234,12 +234,25 @@ macro_rules! content_insertion_fn_body {
     }};
 }
 
+/// The opaque pointer a C caller attaches to a rewritable unit. The
+/// library requires user data to be `Send` (a unit detached by a handler
+/// suspension may cross threads with a `send::HtmlRewriter`); for the C API
+/// that obligation is the caller's, exactly as for every other pointer it
+/// hands us.
+#[derive(Clone, Copy)]
+pub(crate) struct UserDataPtr(pub *mut c_void);
+
+// SAFETY: see above — the C API never dereferences the pointer, it only
+// stores and returns it; thread-safety of what it points to is the caller's
+// contract.
+unsafe impl Send for UserDataPtr {}
+
 macro_rules! get_user_data {
     ($unit:ident) => {
         to_ref!($unit)
             .user_data()
-            .downcast_ref::<*mut c_void>()
-            .map(|d| *d)
+            .downcast_ref::<$crate::UserDataPtr>()
+            .map(|d| d.0)
             .unwrap_or(ptr::null_mut())
     };
 }
