@@ -1,4 +1,5 @@
 use super::SelectorError;
+use super::ast::{MAX_ALTERNATIVES, count_alternatives};
 use crate::html::Namespace;
 use cssparser::{Parser as CssParser, ParserInput, ToCss};
 use selectors::parser::{
@@ -198,6 +199,9 @@ impl SelectorsParser {
         for selector in selector_list {
             for component in selector.iter_raw_match_order() {
                 Self::validate_component(component, inside_any_negation)?;
+            }
+            if !inside_any_negation && count_alternatives(selector) > MAX_ALTERNATIVES {
+                return Err(SelectorError::UnsupportedSyntax);
             }
         }
         Ok(())
