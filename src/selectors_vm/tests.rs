@@ -1231,6 +1231,60 @@ mod vm_tests {
     }
 
     #[test]
+    fn negation_of_compound_selectors_and_selector_lists() {
+        fn matched_ids(selector: &str) -> Vec<String> {
+            let mut ids = Vec::new();
+
+            crate::rewrite_str(
+                "<main id=main>\
+                    <div id=df class=foo></div>\
+                    <div id=db class=bar></div>\
+                    <span id=sf class=foo></span>\
+                    <span id=sb class=bar></span>\
+                </main>",
+                crate::RewriteStrSettings::new().append_element_content_handler(crate::element!(
+                    selector,
+                    |el| {
+                        ids.push(el.get_attribute("id").unwrap());
+                        Ok(())
+                    }
+                )),
+            )
+            .unwrap();
+
+            ids
+        }
+
+        for (selector, expected) in [
+            // `!(div && .foo)`
+            (":not(div.foo)", &["main", "db", "sf", "sb"][..]),
+            (":not(:not(:not(div.foo)))", &["main", "db", "sf", "sb"]),
+            // `!(div || span)`
+            (":not(div, span)", &["main"]),
+            (":not(div):not(span)", &["main"]),
+            // `!!(div || span)`
+            (":not(:not(div, span))", &["df", "db", "sf", "sb"]),
+            (":not(:not(div):not(span))", &["df", "db", "sf", "sb"]),
+            ("span:not(:not(.foo, .bar))", &["sf", "sb"]),
+            // `!!(div && .foo)`
+            (":not(:not(div.foo))", &["df"]),
+            (":not(:not(div), :not(.foo))", &["df"]),
+            (":not(:not(div.foo), :not(span.bar))", &[]),
+            // A `:not()` inside the compound selector of a `:not()`: `!(div && !.foo)`
+            (":not(div:not(.foo))", &["main", "df", "sf", "sb"]),
+            (":not(:not(div).foo)", &["main", "df", "db", "sb"]),
+            ("span:not(.foo:not(div))", &["sb"]),
+            // Alternatives on both sides of a combinator. `#df` matches two of the
+            // `:not(span.bar)` alternatives, and the handler still runs once for it.
+            ("main > :not(div.foo)", &["db", "sf", "sb"]),
+            (":not(div.foo) > :not(span.bar)", &["df", "db", "sf"]),
+            (":not(div.foo) :not(span.bar)", &["df", "db", "sf"]),
+        ] {
+            assert_eq!(matched_ids(selector), expected, "{selector}");
+        }
+    }
+
+    #[test]
     fn lots_of_selectors() {
         let mut vm = create_vm!(
             ('a'..='z')

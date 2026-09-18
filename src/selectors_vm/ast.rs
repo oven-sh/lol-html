@@ -3,6 +3,7 @@ use crate::selectors_vm::{DenseHashSet, MatchId};
 use selectors::attr::{AttrSelectorOperator, ParsedAttrSelectorOperation, ParsedCaseSensitivity};
 use selectors::parser::{Combinator, Component, NthType};
 use std::fmt::{self, Debug, Formatter};
+use std::mem;
 
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
 pub(crate) struct NthChild {
@@ -37,7 +38,7 @@ impl NthChild {
     }
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone)]
 pub(crate) enum OnTagNameExpr {
     ExplicitAny,
     Unmatchable,
@@ -46,7 +47,7 @@ pub(crate) enum OnTagNameExpr {
     NthOfType(NthChild),
 }
 
-#[derive(Eq, PartialEq)]
+#[derive(Eq, PartialEq, Clone)]
 pub(crate) struct AttributeComparisonExpr {
     pub name: Box<str>,
     pub value: Box<str>,
@@ -95,7 +96,7 @@ impl Debug for AttributeComparisonExpr {
 }
 
 /// An attribute check when attributes are received and parsed.
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone)]
 pub(crate) enum OnAttributesExpr {
     Id(Box<str>),
     Class(Box<str>),
@@ -179,7 +180,7 @@ impl From<&Component<SelectorImplDescriptor>> for Condition {
     }
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone)]
 pub(crate) struct Expr<E>
 where
     E: PartialEq + Eq + Debug,
@@ -201,7 +202,7 @@ where
     }
 }
 
-#[derive(PartialEq, Eq, Debug, Default)]
+#[derive(PartialEq, Eq, Debug, Default, Clone)]
 pub(crate) struct Predicate {
     pub on_tag_name_exprs: Vec<Expr<OnTagNameExpr>>,
     pub on_attr_exprs: Vec<Expr<OnAttributesExpr>>,
@@ -224,24 +225,167 @@ impl Predicate {
         }
     }
 
-    fn add_selector_components(
-        &mut self,
-        selector: &selectors::parser::Selector<SelectorImplDescriptor>,
-        negation: bool,
-    ) {
-        for component in selector.iter() {
-            match component {
-                Component::Negation(nested_selectors) => {
-                    for nested_selector in nested_selectors.slice() {
-                        self.add_selector_components(nested_selector, !negation);
-                    }
-                }
-                _ => {
-                    self.add_component(component, negation);
-                }
+    /// The conjunction of `self` and `other`.
+    fn and(mut self, other: &Self) -> Self {
+        self.on_tag_name_exprs
+            .extend_from_slice(&other.on_tag_name_exprs);
+        self.on_attr_exprs.extend_from_slice(&other.on_attr_exprs);
+        self
+    }
+}
+
+/// A disjunction of predicates: an element matches when it matches any one of them.
+///
+/// A [`Predicate`] is a conjunction, so a single one can't express `:not(a.b)`, which is
+/// `:not(a)` OR `:not(b)`, or `:not(:not(a, b))`, which is `a` OR `b`. Every alternative gets
+/// an AST node of its own with the same match id, like every selector of a selector list does.
+type Alternatives = Vec<Predicate>;
+
+/// How many expressions the [`Alternatives`] of one selector can hold before the parser
+/// refuses it.
+///
+/// The expansion multiplies: `:not(a.b):not(c.d)` has 4 alternatives of 2 expressions, one more
+/// `:not()` of that shape doubles the alternatives again, and every alternative of a compound
+/// selector repeats the rest of the selector below it in the AST.
+pub(crate) const MAX_EXPANDED_EXPRS: usize = 4096;
+
+type SelectorComponent = Component<SelectorImplDescriptor>;
+type ComplexSelector = selectors::parser::Selector<SelectorImplDescriptor>;
+
+/// What a selector expands to: the [`Alternatives`] for the AST, or only their
+/// [`ExpansionSize`] for the parser. Both come from the same traversal, so they can't disagree.
+trait Expansion: Sized {
+    /// A simple selector, or its negation.
+    fn of(component: &SelectorComponent, negation: bool) -> Self;
+    /// Matches when all the `operands` match.
+    fn all_of(operands: impl Iterator<Item = Self>) -> Self;
+    /// Matches when any of the `operands` matches.
+    fn any_of(operands: impl Iterator<Item = Self>) -> Self;
+}
+
+impl Expansion for Alternatives {
+    fn of(component: &SelectorComponent, negation: bool) -> Self {
+        let mut predicate = Predicate::default();
+        predicate.add_component(component, negation);
+        vec![predicate]
+    }
+
+    fn all_of(operands: impl Iterator<Item = Self>) -> Self {
+        operands.fold(vec![Predicate::default()], |matched, operand| {
+            if let [only] = operand.as_slice() {
+                matched.into_iter().map(|p| p.and(only)).collect()
+            } else {
+                matched
+                    .iter()
+                    .flat_map(|p| operand.iter().map(|other| p.clone().and(other)))
+                    .collect()
             }
+        })
+    }
+
+    fn any_of(operands: impl Iterator<Item = Self>) -> Self {
+        operands.flatten().collect()
+    }
+}
+
+/// How large [`Alternatives`] are, without building them.
+#[derive(Clone, Copy)]
+pub(crate) struct ExpansionSize {
+    pub alternatives: usize,
+    /// The expressions of all the alternatives together.
+    pub exprs: usize,
+}
+
+impl Expansion for ExpansionSize {
+    fn of(_: &SelectorComponent, _: bool) -> Self {
+        Self {
+            alternatives: 1,
+            exprs: 1,
         }
     }
+
+    fn all_of(operands: impl Iterator<Item = Self>) -> Self {
+        let matched = Self {
+            alternatives: 1,
+            exprs: 0,
+        };
+
+        // Every alternative of one side is repeated for every alternative of the other.
+        operands.fold(matched, |matched, operand| Self {
+            alternatives: matched.alternatives.saturating_mul(operand.alternatives),
+            exprs: usize::saturating_add(
+                matched.exprs.saturating_mul(operand.alternatives),
+                operand.exprs.saturating_mul(matched.alternatives),
+            ),
+        })
+    }
+
+    fn any_of(operands: impl Iterator<Item = Self>) -> Self {
+        let unmatched = Self {
+            alternatives: 0,
+            exprs: 0,
+        };
+        let size = operands.fold(unmatched, |size, operand| Self {
+            alternatives: size.alternatives.saturating_add(operand.alternatives),
+            exprs: size.exprs.saturating_add(operand.exprs),
+        });
+
+        // Nothing to choose from leaves no alternative. Count one, so that a product with it
+        // is never smaller than the alternatives that `all_of` builds on the way to it.
+        Self {
+            alternatives: size.alternatives.max(1),
+            ..size
+        }
+    }
+}
+
+/// Expands a compound selector, or its negation, with De Morgan's laws.
+fn expand_compound<'c, X: Expansion>(
+    components: impl Iterator<Item = &'c SelectorComponent>,
+    negation: bool,
+) -> X {
+    let operands = components
+        // `:not(|p)` has always matched what `:not(p)` matches: the negated no-namespace
+        // prefix was one more term of a conjunction, and it is true for every element. As an
+        // alternative of its own it would make `:not(|p)` match everything.
+        .filter(|component| !(negation && matches!(component, Component::ExplicitNoNamespace)))
+        .map(|component| match component {
+            Component::Negation(selectors) => expand_negation(selectors.slice(), !negation),
+            _ => X::of(component, negation),
+        });
+
+    // `!(a && b)` is `!a || !b`
+    if negation {
+        X::any_of(operands)
+    } else {
+        X::all_of(operands)
+    }
+}
+
+/// Expands the selector list of a `:not()`. `negation` is set when the `:not()` applies, and
+/// unset when an enclosing `:not()` cancels it.
+///
+/// The parser refuses combinators inside `:not()`, so every selector of the list is a single
+/// compound selector.
+fn expand_negation<X: Expansion>(selectors: &[ComplexSelector], negation: bool) -> X {
+    let operands = selectors
+        .iter()
+        .map(|selector| expand_compound(selector.iter(), negation));
+
+    // `!(a || b)` is `!a && !b`
+    if negation {
+        X::all_of(operands)
+    } else {
+        X::any_of(operands)
+    }
+}
+
+/// The size of what [`Ast::add_selector`] builds for `selector`: a path for every combination
+/// of one alternative per compound selector, each with a copy of the predicates along it.
+pub(crate) fn expansion_size(selector: &ComplexSelector) -> ExpansionSize {
+    // A combinator counts as one alternative of one expression, so the product over all the
+    // components is the product over the compound selectors.
+    expand_compound(selector.iter_raw_match_order(), false)
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -296,43 +440,82 @@ impl Ast {
     /// `match_id` is a small integer chosen by the caller. It will be returned back in `MatchInfo`
     pub fn add_selector(&mut self, selector: &Selector, match_id: MatchId) {
         for selector_item in (selector.0).slice() {
-            let mut predicate = Predicate::default();
-            let mut branches = &mut self.root;
+            let components: Vec<_> = selector_item.iter_raw_parse_order_from(0).collect();
 
-            macro_rules! host_and_switch_branch_vec {
-                ($branches:ident) => {{
+            // The compound selectors in parse order, each with the combinator that follows it.
+            let mut compounds: Vec<_> = components
+                .split_inclusive(|component| {
+                    matches!(
+                        component,
+                        Component::Combinator(Combinator::Child | Combinator::Descendant)
+                    )
+                })
+                .map(|compound| match compound.split_last() {
+                    Some((&&Component::Combinator(combinator), compound)) => (
+                        expand_compound::<Alternatives>(compound.iter().copied(), false),
+                        Some(combinator),
+                    ),
+                    _ => (
+                        expand_compound::<Alternatives>(compound.iter().copied(), false),
+                        None,
+                    ),
+                })
+                .collect();
+
+            if compounds
+                .iter()
+                .any(|(alternatives, _)| alternatives.is_empty())
+            {
+                continue;
+            }
+
+            // Every combination of one alternative per compound selector is a path from the
+            // root. `path` counts through the combinations, the last compound selector fastest.
+            let mut path = vec![0; compounds.len()];
+
+            loop {
+                let is_last_path = path
+                    .iter()
+                    .zip(&compounds)
+                    .all(|(&i, (alternatives, _))| i + 1 == alternatives.len());
+                let mut branches = &mut self.root;
+
+                for ((alternatives, combinator), &i) in compounds.iter_mut().zip(&path) {
+                    let predicate = if is_last_path {
+                        mem::take(&mut alternatives[i])
+                    } else {
+                        alternatives[i].clone()
+                    };
                     let node_idx = Self::host_expressions(
                         predicate,
                         branches,
                         &mut self.cumulative_node_count,
                     );
+                    let node = &mut branches[node_idx];
 
-                    branches = &mut branches[node_idx].$branches;
-                    predicate = Predicate::default();
-                }};
-            }
-
-            for component in selector_item.iter_raw_parse_order_from(0) {
-                match component {
-                    Component::Combinator(Combinator::Child) => {
-                        host_and_switch_branch_vec!(children);
-                    }
-                    Component::Combinator(Combinator::Descendant) => {
-                        host_and_switch_branch_vec!(descendants);
-                    }
-                    Component::Negation(ss) => {
-                        for s in ss.slice() {
-                            predicate.add_selector_components(s, true);
+                    branches = match combinator {
+                        Some(Combinator::Child) => &mut node.children,
+                        // `Combinator::Descendant`, the only other one `compounds` splits at
+                        Some(_) => &mut node.descendants,
+                        None => {
+                            node.match_ids.insert(match_id);
+                            break;
                         }
+                    };
+                }
+
+                if is_last_path {
+                    break;
+                }
+
+                for (i, (alternatives, _)) in path.iter_mut().zip(&compounds).rev() {
+                    *i += 1;
+                    if *i < alternatives.len() {
+                        break;
                     }
-                    _ => predicate.add_component(component, false),
+                    *i = 0;
                 }
             }
-
-            let node_idx =
-                Self::host_expressions(predicate, branches, &mut self.cumulative_node_count);
-
-            branches[node_idx].match_ids.insert(match_id);
         }
     }
 }
@@ -1025,6 +1208,137 @@ mod tests {
                 cumulative_node_count: 1,
             },
         );
+    }
+
+    fn tag_name(name: &str, negation: bool) -> Predicate {
+        Predicate {
+            on_tag_name_exprs: vec![Expr {
+                simple_expr: OnTagNameExpr::LocalName(name.into()),
+                negation,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn class(name: &str, negation: bool) -> Predicate {
+        Predicate {
+            on_attr_exprs: vec![Expr {
+                simple_expr: OnAttributesExpr::Class(name.into()),
+                negation,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn leaf(predicate: Predicate) -> AstNode {
+        AstNode {
+            predicate,
+            children: vec![],
+            descendants: vec![],
+            match_ids: DenseHashSet::from([0]),
+        }
+    }
+
+    #[test]
+    fn negated_compound_selector_has_an_alternative_per_simple_selector() {
+        // `!(div && .foo)` is `!div || !.foo`
+        assert_ast(
+            &[":not(div.foo)"],
+            Ast {
+                root: vec![leaf(tag_name("div", true)), leaf(class("foo", true))],
+                cumulative_node_count: 2,
+            },
+        );
+
+        // `!(div || span)` is `!div && !span`
+        assert_ast(
+            &[":not(div, span)"],
+            Ast {
+                root: vec![leaf(tag_name("div", true).and(&tag_name("span", true)))],
+                cumulative_node_count: 1,
+            },
+        );
+    }
+
+    #[test]
+    fn double_negation_of_a_selector_list_has_an_alternative_per_selector() {
+        for selector in [":not(:not(div, span))", ":not(:not(div):not(span))"] {
+            assert_ast(
+                &[selector],
+                Ast {
+                    root: vec![leaf(tag_name("div", false)), leaf(tag_name("span", false))],
+                    cumulative_node_count: 2,
+                },
+            );
+        }
+
+        assert_ast(
+            &[":not(:not(div.foo))"],
+            Ast {
+                root: vec![leaf(tag_name("div", false).and(&class("foo", false)))],
+                cumulative_node_count: 1,
+            },
+        );
+    }
+
+    #[test]
+    fn alternatives_of_every_compound_selector_are_combined() {
+        let child = |predicate| AstNode {
+            children: vec![leaf(tag_name("a", true)), leaf(class("b", true))],
+            match_ids: DenseHashSet::new(),
+            ..leaf(predicate)
+        };
+
+        assert_ast(
+            &[":not(div.foo) > :not(a.b)"],
+            Ast {
+                root: vec![child(tag_name("div", true)), child(class("foo", true))],
+                cumulative_node_count: 6,
+            },
+        );
+    }
+
+    #[test]
+    fn expansion_size_limit() {
+        let selector =
+            |count| -> String { (0..count).map(|i| format!(":not(a{i}.b{i})")).collect() };
+        let size = |selector: &str| {
+            let selector = selector.parse::<Selector>().unwrap();
+            let size = expansion_size(&selector.0.slice()[0]);
+            (size.alternatives, size.exprs)
+        };
+
+        assert_eq!(size("div.foo#bar > p"), (1, 5));
+        assert_eq!(size(":not(a.b)"), (2, 2));
+        assert_eq!(size(":not(a.b):not(c.d)"), (4, 8));
+        assert_eq!(size(":not(:not(a, b.c))"), (2, 3));
+        // Each of the 2 alternatives has the combinator and `p` below it.
+        assert_eq!(size(":not(a.b) > p"), (2, 6));
+
+        // 2^8 alternatives of 8 expressions
+        assert_eq!(size(&selector(8)), (256, 2048));
+        let mut ast = Ast::default();
+        ast.add_selector(&selector(8).parse().unwrap(), 0);
+        assert_eq!(ast.root.len(), 256);
+
+        // 2^9 alternatives of 9 expressions
+        assert_err(&selector(9), SelectorError::UnsupportedSyntax);
+        assert_err(
+            &format!("{} > {}", selector(5), selector(4)),
+            SelectorError::UnsupportedSyntax,
+        );
+        assert_err(&selector(200), SelectorError::UnsupportedSyntax);
+
+        // Every alternative repeats the rest of the selector.
+        let descendants = " x".repeat(3000);
+        assert_err(
+            &format!(":not(a.b){descendants}"),
+            SelectorError::UnsupportedSyntax,
+        );
+
+        // One alternative is what the selector always was, however long it is.
+        assert_eq!(size(&format!(":not(a, b){descendants}")).0, 1);
+        assert_eq!(size(&":not(.a)".repeat(1000)), (1, 1000));
     }
 
     #[test]
