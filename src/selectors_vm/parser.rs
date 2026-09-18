@@ -1,5 +1,5 @@
 use super::SelectorError;
-use super::ast::{MAX_ALTERNATIVES, count_alternatives};
+use super::ast::{MAX_EXPANDED_EXPRS, expansion_size};
 use crate::html::Namespace;
 use cssparser::{Parser as CssParser, ParserInput, ToCss};
 use selectors::parser::{
@@ -200,8 +200,13 @@ impl SelectorsParser {
             for component in selector.iter_raw_match_order() {
                 Self::validate_component(component, inside_any_negation)?;
             }
-            if !inside_any_negation && count_alternatives(selector) > MAX_ALTERNATIVES {
-                return Err(SelectorError::UnsupportedSyntax);
+            if !inside_any_negation {
+                let size = expansion_size(selector);
+
+                // A selector with one alternative builds what it always has, whatever its size.
+                if size.alternatives > 1 && size.exprs > MAX_EXPANDED_EXPRS {
+                    return Err(SelectorError::UnsupportedSyntax);
+                }
             }
         }
         Ok(())

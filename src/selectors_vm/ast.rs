@@ -241,17 +241,19 @@ impl Predicate {
 /// an AST node of its own with the same match id, like every selector of a selector list does.
 type Alternatives = Vec<Predicate>;
 
-/// How many [`Alternatives`] a selector can expand to before the parser refuses it.
+/// How many expressions the [`Alternatives`] of one selector can hold before the parser
+/// refuses it.
 ///
-/// The expansion multiplies: `:not(a.b):not(c.d)` has 4 alternatives, and one more `:not()`
-/// of that shape doubles them again.
-pub(crate) const MAX_ALTERNATIVES: usize = 256;
+/// The expansion multiplies: `:not(a.b):not(c.d)` has 4 alternatives of 2 expressions, one more
+/// `:not()` of that shape doubles the alternatives again, and every alternative of a compound
+/// selector repeats the rest of the selector below it in the AST.
+pub(crate) const MAX_EXPANDED_EXPRS: usize = 4096;
 
 type SelectorComponent = Component<SelectorImplDescriptor>;
 type ComplexSelector = selectors::parser::Selector<SelectorImplDescriptor>;
 
-/// What a selector expands to: the [`Alternatives`] for the AST, or only their number for the
-/// parser. Both come from the same traversal, so they can't disagree.
+/// What a selector expands to: the [`Alternatives`] for the AST, or only their
+/// [`ExpansionSize`] for the parser. Both come from the same traversal, so they can't disagree.
 trait Expansion: Sized {
     /// A simple selector, or its negation.
     fn of(component: &SelectorComponent, negation: bool) -> Self;
@@ -286,17 +288,54 @@ impl Expansion for Alternatives {
     }
 }
 
-impl Expansion for usize {
+/// How large [`Alternatives`] are, without building them.
+#[derive(Clone, Copy)]
+pub(crate) struct ExpansionSize {
+    pub alternatives: usize,
+    /// The expressions of all the alternatives together.
+    pub exprs: usize,
+}
+
+impl Expansion for ExpansionSize {
     fn of(_: &SelectorComponent, _: bool) -> Self {
-        1
+        Self {
+            alternatives: 1,
+            exprs: 1,
+        }
     }
 
     fn all_of(operands: impl Iterator<Item = Self>) -> Self {
-        operands.fold(1, Self::saturating_mul)
+        let matched = Self {
+            alternatives: 1,
+            exprs: 0,
+        };
+
+        // Every alternative of one side is repeated for every alternative of the other.
+        operands.fold(matched, |matched, operand| Self {
+            alternatives: matched.alternatives.saturating_mul(operand.alternatives),
+            exprs: usize::saturating_add(
+                matched.exprs.saturating_mul(operand.alternatives),
+                operand.exprs.saturating_mul(matched.alternatives),
+            ),
+        })
     }
 
     fn any_of(operands: impl Iterator<Item = Self>) -> Self {
-        operands.fold(0, Self::saturating_add)
+        let unmatched = Self {
+            alternatives: 0,
+            exprs: 0,
+        };
+        let size = operands.fold(unmatched, |size, operand| Self {
+            alternatives: size.alternatives.saturating_add(operand.alternatives),
+            exprs: size.exprs.saturating_add(operand.exprs),
+        });
+
+        // Nothing to choose from leaves no alternative. Count one, so that a product with it
+        // is never smaller than the alternatives that `all_of` builds on the way to it.
+        Self {
+            alternatives: size.alternatives.max(1),
+            ..size
+        }
     }
 }
 
@@ -341,11 +380,11 @@ fn expand_negation<X: Expansion>(selectors: &[ComplexSelector], negation: bool) 
     }
 }
 
-/// How many AST paths [`Ast::add_selector`] creates for `selector`: one for every combination
-/// of one alternative per compound selector.
-pub(crate) fn count_alternatives(selector: &ComplexSelector) -> usize {
-    // A combinator counts as 1, so the product over all the components is the product over
-    // the compound selectors.
+/// The size of what [`Ast::add_selector`] builds for `selector`: a path for every combination
+/// of one alternative per compound selector, each with a copy of the predicates along it.
+pub(crate) fn expansion_size(selector: &ComplexSelector) -> ExpansionSize {
+    // A combinator counts as one alternative of one expression, so the product over all the
+    // components is the product over the compound selectors.
     expand_compound(selector.iter_raw_match_order(), false)
 }
 
@@ -1260,15 +1299,29 @@ mod tests {
     }
 
     #[test]
-    fn too_many_alternatives() {
+    fn expansion_size_limit() {
         let selector =
             |count| -> String { (0..count).map(|i| format!(":not(a{i}.b{i})")).collect() };
+        let size = |selector: &str| {
+            let selector = selector.parse::<Selector>().unwrap();
+            let size = expansion_size(&selector.0.slice()[0]);
+            (size.alternatives, size.exprs)
+        };
 
-        // 2^8 alternatives
+        assert_eq!(size("div.foo#bar > p"), (1, 5));
+        assert_eq!(size(":not(a.b)"), (2, 2));
+        assert_eq!(size(":not(a.b):not(c.d)"), (4, 8));
+        assert_eq!(size(":not(:not(a, b.c))"), (2, 3));
+        // Each of the 2 alternatives has the combinator and `p` below it.
+        assert_eq!(size(":not(a.b) > p"), (2, 6));
+
+        // 2^8 alternatives of 8 expressions
+        assert_eq!(size(&selector(8)), (256, 2048));
         let mut ast = Ast::default();
         ast.add_selector(&selector(8).parse().unwrap(), 0);
-        assert_eq!(ast.root.len(), MAX_ALTERNATIVES);
+        assert_eq!(ast.root.len(), 256);
 
+        // 2^9 alternatives of 9 expressions
         assert_err(&selector(9), SelectorError::UnsupportedSyntax);
         assert_err(
             &format!("{} > {}", selector(5), selector(4)),
@@ -1276,8 +1329,16 @@ mod tests {
         );
         assert_err(&selector(200), SelectorError::UnsupportedSyntax);
 
-        // Every `:not()` has one alternative here, however many there are.
-        ":not(.a)".repeat(1000).parse::<Selector>().unwrap();
+        // Every alternative repeats the rest of the selector.
+        let descendants = " x".repeat(3000);
+        assert_err(
+            &format!(":not(a.b){descendants}"),
+            SelectorError::UnsupportedSyntax,
+        );
+
+        // One alternative is what the selector always was, however long it is.
+        assert_eq!(size(&format!(":not(a, b){descendants}")).0, 1);
+        assert_eq!(size(&":not(.a)".repeat(1000)), (1, 1000));
     }
 
     #[test]
