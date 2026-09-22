@@ -1,8 +1,18 @@
 name: bun
 
 # Runs the crate's own test suite against the `bun` branch. Upstream's
-# `ci.yml` only triggers on `master`; this file is additive so rebasing the
-# fork onto a new upstream tag does not have to re-edit `ci.yml`.
+# `ci.yml` runs on every pull request, but on a push only for upstream's
+# default branch; this file is additive so rebasing the fork onto a new
+# upstream tag does not have to re-edit the triggers in `ci.yml`.
+#
+# The oven-sh organization rejects an action that is not pinned to a
+# full-length commit SHA: the job fails at "Set up job". So every `uses:` in
+# this directory is pinned, upstream's workflows included. After a rebase that
+# brings in new `uses:` lines from upstream, pin those too.
+# For dtolnay/rust-toolchain, pin a commit from its `master` branch. Its
+# README says other commits get garbage-collected, and the commit behind
+# `@stable` is one of those. `master` has no default toolchain, so pass
+# `toolchain:`.
 on:
   push:
     branches:
@@ -20,12 +30,14 @@ jobs:
     name: cargo test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           key: index-${{ hashFiles('Cargo.toml') }}
           path: |
@@ -34,9 +46,9 @@ jobs:
       - name: Fetch dependencies
         run: cargo fetch
       - name: Cache target directory
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           key: target-bun-${{ hashFiles('Cargo.lock') }}
           path: target
       - name: Run tests
-        run: cargo test --features=integration_test --target-dir=target
+        run: cargo test --features=_integration_test --target-dir=target
