@@ -51,4 +51,4 @@ jobs:
           key: target-bun-${{ hashFiles('Cargo.lock') }}
           path: target
       - name: Run tests
-        run: cargo test --features=integration_test --target-dir=target
+        run: cargo test --features=_integration_test --target-dir=target
