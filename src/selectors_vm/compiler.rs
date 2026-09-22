@@ -8,6 +8,7 @@ use crate::base::{BytesCow, HasReplacementsError};
 use crate::html::LocalName;
 use encoding_rs::Encoding;
 use selectors::attr::{AttrSelectorOperator, ParsedCaseSensitivity};
+use std::mem;
 
 type BytesOwned = Box<[u8]>;
 
@@ -254,18 +255,17 @@ impl Compiler {
     }
 
     #[inline]
-    fn compile_descendants(
-        &mut self,
-        nodes: Vec<AstNode>,
-        enable_nth_of_type: &mut bool,
-    ) -> Option<AddressRange> {
+    fn reserve_descendants(&mut self, nodes: &[AstNode]) -> Option<AddressRange> {
         if nodes.is_empty() {
             None
         } else {
-            Some(self.compile_nodes(nodes, enable_nth_of_type))
+            Some(self.reserve(nodes))
         }
     }
 
+    /// Walks the node tree with an explicit work list, so the native stack
+    /// depth does not grow with the number of combinators in a selector
+    /// (`a b c ...` builds a chain one node deep per combinator).
     fn compile_nodes(
         &mut self,
         nodes: Vec<AstNode>,
@@ -274,20 +274,43 @@ impl Compiler {
         // NOTE: we need sibling nodes to be in a contiguous region, so
         // we can reference them by range instead of vector of addresses.
         let addr_range = self.reserve(&nodes);
+        let mut pending = Vec::new();
+        let mut next = Some((nodes, addr_range.clone()));
 
-        for (node, position) in nodes.into_iter().zip(addr_range.clone()) {
-            let branch = ExecutionBranch {
-                matched_ids: node.match_ids,
-                jumps: self.compile_descendants(node.children, enable_nth_of_type),
-                hereditary_jumps: self.compile_descendants(node.descendants, enable_nth_of_type),
-            };
-            let compiled = self.compile_predicate(node.predicate, branch, enable_nth_of_type);
+        while let Some((nodes, range)) = next {
+            for (node, position) in nodes.into_iter().zip(range) {
+                let AstNode {
+                    predicate,
+                    children,
+                    descendants,
+                    match_ids,
+                } = node;
+                let jumps = self.reserve_descendants(&children);
+                let hereditary_jumps = self.reserve_descendants(&descendants);
 
-            debug_assert!(self.instructions[position].local_name_exprs.is_empty());
-            debug_assert!(self.instructions[position].attribute_exprs.is_empty());
-            if let Some(inst) = self.instructions.get_mut(position) {
-                *inst = compiled;
+                let branch = ExecutionBranch {
+                    matched_ids: match_ids,
+                    jumps: jumps.clone(),
+                    hereditary_jumps: hereditary_jumps.clone(),
+                };
+                let compiled = self.compile_predicate(predicate, branch, enable_nth_of_type);
+
+                debug_assert!(self.instructions[position].local_name_exprs.is_empty());
+                debug_assert!(self.instructions[position].attribute_exprs.is_empty());
+                if let Some(inst) = self.instructions.get_mut(position) {
+                    *inst = compiled;
+                }
+
+                if let Some(range) = jumps {
+                    pending.push((children, range));
+                }
+
+                if let Some(range) = hereditary_jumps {
+                    pending.push((descendants, range));
+                }
             }
+
+            next = pending.pop();
         }
 
         addr_range
@@ -298,13 +321,13 @@ impl Compiler {
     // It's better to outline it, and let its callers be inlined.
     #[must_use]
     #[inline(never)]
-    pub fn compile(mut self, ast: Ast) -> Program {
+    pub fn compile(mut self, mut ast: Ast) -> Program {
         let mut enable_nth_of_type = false;
         self.instructions = (0..ast.cumulative_node_count)
             .map(|_| Instruction::noop())
             .collect();
 
-        let entry_points = self.compile_nodes(ast.root, &mut enable_nth_of_type);
+        let entry_points = self.compile_nodes(mem::take(&mut ast.root), &mut enable_nth_of_type);
         debug_assert!(
             self.instructions
                 .iter()

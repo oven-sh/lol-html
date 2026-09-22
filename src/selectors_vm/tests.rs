@@ -1936,6 +1936,51 @@ mod compiler {
     }
 
     #[test]
+    fn deep_combinator_chain() {
+        // Native stack usage must not grow with the combinator count.
+        const DEPTH: usize = 100_000;
+
+        for (combinator, is_hereditary) in [(" ", true), (" > ", false)] {
+            let selector = vec!["p"; DEPTH].join(combinator);
+            let program = test_compile(&[&selector], UTF_8, 1);
+
+            assert_eq!(program.instructions.len(), DEPTH);
+
+            // The program is one chain: each instruction jumps to the next
+            // one, and only the last one reports the match.
+            let mut addr = program.entry_points.start;
+
+            for remaining in (0..DEPTH).rev() {
+                let branch = &program.instructions[addr].associated_branch;
+                let (next, unused) = if is_hereditary {
+                    (&branch.hereditary_jumps, &branch.jumps)
+                } else {
+                    (&branch.jumps, &branch.hereditary_jumps)
+                };
+
+                assert_eq!(*unused, None);
+
+                if remaining == 0 {
+                    assert_eq!(*next, None);
+                    assert_eq!(branch.matched_ids, DenseHashSet::from([0]));
+                } else {
+                    let next = next.as_ref().expect("chain ended early");
+
+                    assert_eq!(next.len(), 1);
+                    assert_eq!(branch.matched_ids, DenseHashSet::new());
+                    addr = next.start;
+                }
+            }
+
+            // An AST that is dropped without compilation must not recurse either.
+            let mut ast = Ast::default();
+
+            ast.add_selector(&selector.parse().unwrap(), 0);
+            drop(ast);
+        }
+    }
+
+    #[test]
     fn multiple_entry_points() {
         assert_entry_points_match(
             &["div", "div.c1.c2", "#foo", ".c1#foo"],
