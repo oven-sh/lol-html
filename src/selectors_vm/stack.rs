@@ -207,6 +207,12 @@ impl<'i, E: ElementData> StackItem<'i, E> {
     }
 }
 
+/// `open_name_counts` are built when the stack gets deeper than this.
+const OPEN_NAME_COUNTS_MIN_DEPTH: usize = 64;
+/// `open_name_counts` are dropped when the stack gets shallower than this. It is lower than
+/// [`OPEN_NAME_COUNTS_MIN_DEPTH`] so that a document can't have them rebuilt at every tag.
+const OPEN_NAME_COUNTS_DROP_DEPTH: usize = OPEN_NAME_COUNTS_MIN_DEPTH / 2;
+
 pub(crate) struct Stack<E: ElementData> {
     /// A counter for root elements
     root_child_counter: ChildCounter,
@@ -214,7 +220,10 @@ pub(crate) struct Stack<E: ElementData> {
     typed_child_counters: Option<TypedChildCounterMap>,
     items: LimitedVec<StackItem<'static, E>>,
     /// Per-name open-item counts so `pop_up_to` can reject a stray end tag in O(1).
-    open_name_counts: HashMap<LocalName<'static>, usize>,
+    ///
+    /// Kept only while the stack is deep. A shallow stack is cheaper to scan than the counts
+    /// are to maintain for every element of an ordinary page.
+    open_name_counts: Option<HashMap<LocalName<'static>, usize>>,
     /// Distinct hereditary-jump ranges from open items, with the shallowest depth that introduced each.
     active_hereditary_jumps: Vec<(AddressRange, usize)>,
 }
@@ -227,7 +236,7 @@ impl<E: ElementData> Stack<E> {
             root_child_counter: Default::default(),
             typed_child_counters: enable_nth_of_type.then(TypedChildCounterMap::new),
             items: LimitedVec::new(memory_limiter),
-            open_name_counts: HashMap::new(),
+            open_name_counts: None,
             active_hereditary_jumps: Vec::new(),
         }
     }
@@ -286,8 +295,10 @@ impl<E: ElementData> Stack<E> {
         local_name: LocalName<'_>,
         mut popped_element_data_handler: impl FnMut(E),
     ) {
-        if !self.open_name_counts.contains_key(&local_name) {
-            return;
+        if let Some(counts) = &self.open_name_counts {
+            if !counts.contains_key(&local_name) {
+                return;
+            }
         }
         let pop_to_index = self
             .items
@@ -298,15 +309,18 @@ impl<E: ElementData> Stack<E> {
                 c.pop_to(index);
             }
             self.active_hereditary_jumps.retain(|(_, d)| *d < index);
+            if index < OPEN_NAME_COUNTS_DROP_DEPTH {
+                self.open_name_counts = None;
+            }
             for item in self.items.drain(index..) {
-                if let RawEntryMut::Occupied(mut e) = self
-                    .open_name_counts
-                    .raw_entry_mut()
-                    .from_key(&item.local_name)
-                {
-                    *e.get_mut() -= 1;
-                    if *e.get() == 0 {
-                        e.remove();
+                if let Some(counts) = &mut self.open_name_counts {
+                    if let RawEntryMut::Occupied(mut e) =
+                        counts.raw_entry_mut().from_key(&item.local_name)
+                    {
+                        *e.get_mut() -= 1;
+                        if *e.get() == 0 {
+                            e.remove();
+                        }
                     }
                 }
                 popped_element_data_handler(item.element_data);
@@ -339,10 +353,15 @@ impl<E: ElementData> Stack<E> {
         let depth = self.items.len();
         self.items.push(item)?;
         let item = self.items.last().expect("just pushed");
-        *self
-            .open_name_counts
-            .entry(item.local_name.clone())
-            .or_default() += 1;
+        if let Some(counts) = &mut self.open_name_counts {
+            *counts.entry(item.local_name.clone()).or_default() += 1;
+        } else if self.items.len() > OPEN_NAME_COUNTS_MIN_DEPTH {
+            let mut counts = HashMap::with_capacity(self.items.len());
+            for item in self.items.iter() {
+                *counts.entry(item.local_name.clone()).or_default() += 1;
+            }
+            self.open_name_counts = Some(counts);
+        }
         for r in &item.hereditary_jumps {
             if !self.active_hereditary_jumps.iter().any(|(a, _)| a == r) {
                 self.active_hereditary_jumps.push((r.clone(), depth));
@@ -439,6 +458,67 @@ mod tests {
         assert!(stack.items().is_empty());
 
         stack.pop_up_to(local_name("a"), |_| unreachable!("stack is empty"));
+    }
+
+    #[test]
+    fn open_name_counts_exist_only_while_the_stack_is_deep() {
+        let mut stack = Stack::new(SharedMemoryLimiter::new(1 << 20), false);
+        let open_names = |stack: &Stack<TestElementData>| {
+            stack.open_name_counts.as_ref().map(|counts| {
+                let mut counts: Vec<_> = counts.iter().map(|(n, c)| (n.clone(), *c)).collect();
+                counts.sort_by_key(|(name, count)| (*count, format!("{name:?}")));
+                counts
+            })
+        };
+
+        stack.push_item(item("a", 0)).unwrap();
+        for data in 1..OPEN_NAME_COUNTS_MIN_DEPTH {
+            stack.push_item(item("b", data)).unwrap();
+        }
+        assert_eq!(open_names(&stack), None);
+
+        // One more item makes the stack deep: the counts cover the items below it too.
+        stack.push_item(item("c", 0)).unwrap();
+        let b_count = OPEN_NAME_COUNTS_MIN_DEPTH - 1;
+        assert_eq!(
+            open_names(&stack),
+            Some(vec![
+                (local_name("a"), 1),
+                (local_name("c"), 1),
+                (local_name("b"), b_count)
+            ])
+        );
+
+        stack.pop_up_to(local_name("d"), |_| unreachable!("should not pop"));
+        assert_eq!(stack.items().len(), OPEN_NAME_COUNTS_MIN_DEPTH + 1);
+
+        // Still deep enough after `c` and one `b` are gone: the counts follow.
+        let mut popped = 0;
+        stack.pop_up_to(local_name("b"), |_| popped += 1);
+        assert_eq!(popped, 2);
+        assert_eq!(
+            open_names(&stack),
+            Some(vec![(local_name("a"), 1), (local_name("b"), b_count - 1)])
+        );
+        stack.pop_up_to(local_name("c"), |_| unreachable!("should not pop"));
+
+        // Shallow again: no counts, and the scan finds `a`.
+        while stack.items().len() >= OPEN_NAME_COUNTS_DROP_DEPTH {
+            stack.pop_up_to(local_name("b"), |_| {});
+        }
+        assert_eq!(open_names(&stack), None);
+        stack.pop_up_to(local_name("c"), |_| unreachable!("should not pop"));
+        stack.pop_up_to(local_name("a"), |_| {});
+        assert!(stack.items().is_empty());
+
+        // Deep again: the counts are rebuilt from the items.
+        for data in 0..=OPEN_NAME_COUNTS_MIN_DEPTH {
+            stack.push_item(item("e", data)).unwrap();
+        }
+        assert_eq!(
+            open_names(&stack),
+            Some(vec![(local_name("e"), OPEN_NAME_COUNTS_MIN_DEPTH + 1)])
+        );
     }
 
     #[test]
