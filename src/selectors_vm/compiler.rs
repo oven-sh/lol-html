@@ -11,6 +11,7 @@ use selectors::attr::{AttrSelectorOperator, ParsedCaseSensitivity};
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::iter;
+use std::mem;
 
 type BytesOwned = Box<[u8]>;
 
@@ -260,18 +261,17 @@ where
     }
 
     #[inline]
-    fn compile_descendants(
-        &mut self,
-        nodes: Vec<AstNode<P>>,
-        enable_nth_of_type: &mut bool,
-    ) -> Option<AddressRange> {
+    fn reserve_descendants(&mut self, nodes: &[AstNode<P>]) -> Option<AddressRange> {
         if nodes.is_empty() {
             None
         } else {
-            Some(self.compile_nodes(nodes, enable_nth_of_type))
+            Some(self.reserve(nodes))
         }
     }
 
+    /// Walks the node tree with an explicit work list, so the native stack
+    /// depth does not grow with the number of combinators in a selector
+    /// (`a b c ...` builds a chain one node deep per combinator).
     fn compile_nodes(
         &mut self,
         nodes: Vec<AstNode<P>>,
@@ -280,16 +280,39 @@ where
         // NOTE: we need sibling nodes to be in a contiguous region, so
         // we can reference them by range instead of vector of addresses.
         let addr_range = self.reserve(&nodes);
+        let mut pending = Vec::new();
+        let mut next = Some((nodes, addr_range.clone()));
 
-        for (node, position) in nodes.into_iter().zip(addr_range.clone()) {
-            let branch = ExecutionBranch {
-                matched_payload: node.payload,
-                jumps: self.compile_descendants(node.children, enable_nth_of_type),
-                hereditary_jumps: self.compile_descendants(node.descendants, enable_nth_of_type),
-            };
+        while let Some((nodes, range)) = next {
+            for (node, position) in nodes.into_iter().zip(range) {
+                let AstNode {
+                    predicate,
+                    children,
+                    descendants,
+                    payload,
+                } = node;
+                let jumps = self.reserve_descendants(&children);
+                let hereditary_jumps = self.reserve_descendants(&descendants);
 
-            self.instructions[position] =
-                Some(self.compile_predicate(&node.predicate, branch, enable_nth_of_type));
+                let branch = ExecutionBranch {
+                    matched_payload: payload,
+                    jumps: jumps.clone(),
+                    hereditary_jumps: hereditary_jumps.clone(),
+                };
+
+                self.instructions[position] =
+                    Some(self.compile_predicate(&predicate, branch, enable_nth_of_type));
+
+                if let Some(range) = jumps {
+                    pending.push((children, range));
+                }
+
+                if let Some(range) = hereditary_jumps {
+                    pending.push((descendants, range));
+                }
+            }
+
+            next = pending.pop();
         }
 
         addr_range
@@ -300,13 +323,13 @@ where
     // It's better to outline it, and let its callers be inlined.
     #[must_use]
     #[inline(never)]
-    pub fn compile(mut self, ast: Ast<P>) -> Program<P> {
+    pub fn compile(mut self, mut ast: Ast<P>) -> Program<P> {
         let mut enable_nth_of_type = false;
         self.instructions = iter::repeat_with(|| None)
             .take(ast.cumulative_node_count)
             .collect();
 
-        let entry_points = self.compile_nodes(ast.root, &mut enable_nth_of_type);
+        let entry_points = self.compile_nodes(mem::take(&mut ast.root), &mut enable_nth_of_type);
 
         Program {
             instructions: self
@@ -937,6 +960,51 @@ mod tests {
                     ("<span lang='en-GB'", false),
                 ],
             );
+        }
+    }
+
+    #[test]
+    fn deep_combinator_chain() {
+        // Native stack usage must not grow with the combinator count.
+        const DEPTH: usize = 100_000;
+
+        for (combinator, is_hereditary) in [(" ", true), (" > ", false)] {
+            let selector = vec!["p"; DEPTH].join(combinator);
+            let program = test_compile(&[&selector], UTF_8, 1);
+
+            assert_eq!(program.instructions.len(), DEPTH);
+
+            // The program is one chain: each instruction jumps to the next
+            // one, and only the last one reports the match.
+            let mut addr = program.entry_points.start;
+
+            for remaining in (0..DEPTH).rev() {
+                let branch = &program.instructions[addr].associated_branch;
+                let (next, unused) = if is_hereditary {
+                    (&branch.hereditary_jumps, &branch.jumps)
+                } else {
+                    (&branch.jumps, &branch.hereditary_jumps)
+                };
+
+                assert_eq!(*unused, None);
+
+                if remaining == 0 {
+                    assert_eq!(*next, None);
+                    assert_eq!(branch.matched_payload.iter().collect::<Vec<_>>(), [&0]);
+                } else {
+                    let next = next.as_ref().expect("chain ended early");
+
+                    assert_eq!(next.len(), 1);
+                    assert!(branch.matched_payload.is_empty());
+                    addr = next.start;
+                }
+            }
+
+            // An AST that is dropped without compilation must not recurse either.
+            let mut ast = Ast::default();
+
+            ast.add_selector(&selector.parse().unwrap(), 0, Default::default());
+            drop(ast);
         }
     }
 

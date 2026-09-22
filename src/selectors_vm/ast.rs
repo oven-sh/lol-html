@@ -4,6 +4,7 @@ use selectors::attr::{AttrSelectorOperator, ParsedCaseSensitivity};
 use selectors::parser::{Combinator, Component, NthType};
 use std::fmt::{self, Debug, Formatter};
 use std::hash::Hash;
+use std::mem;
 
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
 pub(crate) struct NthChild {
@@ -243,6 +244,23 @@ where
     pub(crate) root: Vec<AstNode<P>>,
     // NOTE: used to preallocate instruction vector during compilation.
     pub(crate) cumulative_node_count: usize,
+}
+
+/// The derived drop glue recurses once per tree level, and a selector chain
+/// like `a b c ...` is one level deep per combinator. Flatten the tree into a
+/// work list first so that the recursion never happens.
+impl<P> Drop for Ast<P>
+where
+    P: PartialEq + Eq + Copy + Debug + Hash,
+{
+    fn drop(&mut self) {
+        let mut pending = mem::take(&mut self.root);
+
+        while let Some(mut node) = pending.pop() {
+            pending.append(&mut node.children);
+            pending.append(&mut node.descendants);
+        }
+    }
 }
 
 impl<P> Ast<P>
