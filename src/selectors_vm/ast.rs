@@ -3,6 +3,7 @@ use crate::selectors_vm::{DenseHashSet, MatchId};
 use selectors::attr::{AttrSelectorOperator, ParsedAttrSelectorOperation, ParsedCaseSensitivity};
 use selectors::parser::{Combinator, Component, NthType};
 use std::fmt::{self, Debug, Formatter};
+use std::mem;
 
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
 pub(crate) struct NthChild {
@@ -271,6 +272,20 @@ pub struct Ast {
     pub(crate) root: Vec<AstNode>,
     // NOTE: used to preallocate instruction vector during compilation.
     pub(crate) cumulative_node_count: usize,
+}
+
+/// The derived drop glue recurses once per tree level, and a selector chain
+/// like `a b c ...` is one level deep per combinator. Flatten the tree into a
+/// work list first so that the recursion never happens.
+impl Drop for Ast {
+    fn drop(&mut self) {
+        let mut pending = mem::take(&mut self.root);
+
+        while let Some(mut node) = pending.pop() {
+            pending.append(&mut node.children);
+            pending.append(&mut node.descendants);
+        }
+    }
 }
 
 impl Ast {
