@@ -8,6 +8,7 @@ use crate::base::{BytesCow, HasReplacementsError};
 use crate::html::LocalName;
 use encoding_rs::Encoding;
 use selectors::attr::{AttrSelectorOperator, ParsedCaseSensitivity};
+use smallvec::SmallVec;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::iter;
@@ -280,7 +281,8 @@ where
         // NOTE: we need sibling nodes to be in a contiguous region, so
         // we can reference them by range instead of vector of addresses.
         let addr_range = self.reserve(&nodes);
-        let mut pending = Vec::new();
+        // Inline storage, so that an ordinary set of selectors allocates nothing here.
+        let mut pending = SmallVec::<[_; 8]>::new();
         let mut next = Some((nodes, addr_range.clone()));
 
         while let Some((nodes, range)) = next {

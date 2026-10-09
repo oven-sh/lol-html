@@ -161,7 +161,7 @@ dependencies = [
 
 [[package]]
 name = "lol_html"
-version = "2.7.1"
+version = "2.7.2"
 dependencies = [
  "bitflags",
  "cfg-if",
@@ -173,6 +173,7 @@ dependencies = [
  "mime",
  "precomputed-hash",
  "selectors",
+ "smallvec",
  "thiserror",
 ]
 
