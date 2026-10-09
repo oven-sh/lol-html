@@ -149,6 +149,7 @@ dependencies = [
  "mime",
  "precomputed-hash",
  "selectors",
+ "smallvec",
  "thiserror",
 ]
 
