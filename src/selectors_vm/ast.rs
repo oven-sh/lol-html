@@ -942,6 +942,88 @@ mod tests {
         );
     }
 
+    fn nested(open: &str, depth: usize, innermost: &str) -> String {
+        format!("{}{innermost}{}", open.repeat(depth), ")".repeat(depth))
+    }
+
+    #[test]
+    fn nested_block_limit() {
+        assert!(nested(":not(", 4, "div").parse::<Selector>().is_ok());
+        assert_err(&nested(":not(", 5, "div"), SelectorError::UnsupportedSyntax);
+
+        // `[` and `:nth-child(` open a block too.
+        for innermost in ["[a]", ":nth-child(2)"] {
+            assert!(nested(":not(", 3, innermost).parse::<Selector>().is_ok());
+            assert_err(
+                &nested(":not(", 4, innermost),
+                SelectorError::UnsupportedSyntax,
+            );
+        }
+
+        assert_err(
+            &nested(":host(", 4, "div"),
+            SelectorError::UnsupportedPseudoClassOrElement,
+        );
+        assert_err(
+            &nested(":host(", 5, "div"),
+            SelectorError::UnsupportedSyntax,
+        );
+    }
+
+    #[test]
+    fn deep_nesting_does_not_recurse() {
+        const DEPTH: usize = 8000;
+
+        let selectors = [
+            nested(":not(", DEPTH, "span"),
+            nested(":host(", DEPTH, "span"),
+            nested(":NOT(", DEPTH, "span"),
+            nested(r":\6e ot(", DEPTH, "span"),
+            nested(":not(a,", DEPTH, "span"),
+            ":not(".repeat(DEPTH),
+            format!(r#"/*"*/{}"#, nested(":not(", DEPTH, "span")),
+            format!("{}span{}", ":not(/*)*/".repeat(DEPTH), ")".repeat(DEPTH)),
+        ];
+
+        // A parser that recursed once per level would overflow this stack.
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                for selector in &selectors {
+                    assert_eq!(
+                        selector.parse::<Selector>().unwrap_err(),
+                        SelectorError::UnsupportedSyntax,
+                        "{}",
+                        &selector[..16]
+                    );
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn parentheses_that_do_not_nest() {
+        let flat_negations: String = (0..1000).map(|i| format!(":not(.x{i})")).collect();
+        let list = (0..1000)
+            .map(|i| format!("li:nth-child({i})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        for selector in [
+            &format!(r#"[data-x="{}"]"#, "(".repeat(200)),
+            &format!("a{}", r"\(".repeat(400)),
+            "/*((((*/div",
+            &flat_negations,
+            &list,
+            "p:not(:nth-child(2))",
+            ":not(:not(:not(div)))",
+        ] {
+            assert!(selector.parse::<Selector>().is_ok(), "{selector}");
+        }
+    }
+
     #[test]
     fn nth_child_is_index() {
         let even = NthChild::new(2, 0);
