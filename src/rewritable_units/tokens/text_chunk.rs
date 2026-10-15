@@ -37,6 +37,12 @@ use std::fmt::{self, Debug};
 ///
 /// It is important to observe [`TextChunk::text_type`] and unescape/escape the chunks accordingly.
 ///
+/// ## The text may not be the bytes of the document
+///
+/// In a UTF-8 document, input that is not well-formed UTF-8 shows as U+FFFD in the text of a chunk.
+/// The bytes themselves are kept: a chunk that no handler edits, replaces or removes is written
+/// with the bytes it had in the input. Upstream lol-html writes the U+FFFD instead.
+///
 /// # Example
 /// ```
 /// use lol_html::{HtmlRewriter, Settings, text};
@@ -71,6 +77,8 @@ pub struct TextChunk<'i> {
     text: Cow<'i, str>,
     text_type: TextType,
     last_in_text_node: bool,
+    /// `true` once a handler may have edited the text in place.
+    text_edited: bool,
     encoding: &'static Encoding,
     mutations: Mutations,
     user_data: Box<dyn Any + Send>,
@@ -91,6 +99,7 @@ impl<'i> TextChunk<'i> {
             text: text.into(),
             text_type,
             last_in_text_node,
+            text_edited: false,
             encoding,
             mutations: Mutations::new(),
             user_data: Box::new(()),
@@ -111,6 +120,7 @@ impl<'i> TextChunk<'i> {
             text: Cow::Owned(std::mem::take(&mut self.text).into_owned()),
             text_type: self.text_type,
             last_in_text_node: self.last_in_text_node,
+            text_edited: self.text_edited,
             encoding: self.encoding,
             mutations: std::mem::replace(&mut self.mutations, Mutations::new()),
             user_data: std::mem::replace(&mut self.user_data, Box::new(())),
@@ -140,6 +150,7 @@ impl<'i> TextChunk<'i> {
     /// It may be necessary to buffer the text. See [`TextChunk::last_in_text_node`].
     #[inline]
     pub fn as_mut_str(&mut self) -> &mut String {
+        self.text_edited = true;
         self.text.to_mut()
     }
 
@@ -149,6 +160,7 @@ impl<'i> TextChunk<'i> {
     /// See [`TextChunk::text_type`].
     #[inline]
     pub fn set_str(&mut self, text: String) {
+        self.text_edited = true;
         self.text = Cow::Owned(text);
     }
 
@@ -350,6 +362,59 @@ impl<'i> TextChunk<'i> {
             sink.write_str(&self.text, ContentType::Html);
         }
         Ok(())
+    }
+
+    /// Serializes a chunk whose text is a lossy decoding of `source` (malformed input
+    /// shows in it as U+FFFD): the chunk is written back from `source`, unless a handler
+    /// replaced, removed or edited it.
+    ///
+    /// Upstream lol-html writes the decoded text back here, and so does Cloudflare
+    /// Workers: malformed input leaves as U+FFFD even when no handler touched the
+    /// chunk. This fork keeps the source bytes instead, because a handler that only
+    /// observes a chunk must not change the document.
+    ///
+    /// The content around the chunk follows the same order as `impl_serialize!`.
+    #[cold]
+    pub(crate) fn into_bytes_from_source(
+        mut self,
+        source: [&[u8]; 2],
+        output_handler: &mut dyn FnMut(&[u8]),
+    ) -> Result<(), RewritingError> {
+        if self.text_edited {
+            return crate::rewritable_units::Serialize::into_bytes(self, output_handler);
+        }
+        let write_source = |output_handler: &mut dyn FnMut(&[u8])| {
+            for part in source {
+                if !part.is_empty() {
+                    output_handler(part);
+                }
+            }
+        };
+        match self.mutations.take() {
+            None => {
+                write_source(output_handler);
+                Ok(())
+            }
+            Some(mutations) => {
+                let mut sink = StreamingHandlerSink::new(self.encoding, output_handler);
+                mutations
+                    .content_before
+                    .encode(&mut sink)
+                    .map_err(RewritingError::ContentHandlerError)?;
+                if !mutations.removed {
+                    write_source(sink.output_handler());
+                } else {
+                    mutations
+                        .replacement
+                        .encode(&mut sink)
+                        .map_err(RewritingError::ContentHandlerError)?;
+                }
+                mutations
+                    .content_after
+                    .encode(&mut sink)
+                    .map_err(RewritingError::ContentHandlerError)
+            }
+        }
     }
 
     /// Position of this text fragment in the source document, before any rewriting
@@ -558,6 +623,568 @@ mod tests {
                 }
             });
             assert_eq!("<p>\u{fffd}\u{fffd}\u{fffd} last</p>", rewritten);
+        }
+    }
+
+    /// What is written for a chunk of a UTF-8 document that no handler
+    /// edited, replaced or removed: the bytes it was decoded from.
+    mod source_bytes {
+        use super::*;
+        use crate::errors::SuspensionRequest;
+        use crate::{ElementContentHandlers, HandlerResult, Selector, Settings};
+        use std::borrow::Cow;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        const SUSPEND: fn() -> HandlerResult = || Err(SuspensionRequest.into());
+
+        /// A text handler for the elements `selector` matches.
+        fn on_text<'h>(
+            selector: &str,
+            handler: impl FnMut(&mut TextChunk<'_>) -> HandlerResult + 'h,
+        ) -> (Cow<'static, Selector>, ElementContentHandlers<'h>) {
+            (
+                Cow::Owned(selector.parse().unwrap()),
+                ElementContentHandlers::default().text(handler),
+            )
+        }
+
+        /// Documents with text that is not well-formed UTF-8.
+        const DAMAGED: &[&[u8]] = &[
+            // windows-1252 and Shift_JIS text
+            b"<p>caf\xE9</p>",
+            b"<p>\x93\xFA\x96\x7B</p>",
+            // an overlong sequence, a byte that is never valid, a surrogate
+            b"<p>a\xC0\xAF\xFF\xED\xA0\x80b</p>",
+            // sequences cut short by the end tag, by a comment, by the end of the input
+            b"<p>aa\xE2</p>",
+            b"<p>aa\xE2\x82</p>",
+            b"<p>\xF0\x9F\x98</p>",
+            b"<p>\xE2</p>",
+            b"<p>caf\xC3<!---->\xA9</p>",
+            b"caf\xE9",
+            b"<p>caf\xE2\x82",
+            // every kind of text
+            b"<script>var x = '\xE9';</script>",
+            b"<style>a:after{content:'\xE9'}</style>",
+            b"<title>caf\xE9</title>",
+            b"<textarea>caf\xE9</textarea>",
+            b"<svg><![CDATA[caf\xE9]]></svg>",
+            b"<plaintext>caf\xE9",
+            // several text nodes, and text longer than the decoding buffer
+            b"<p>caf\xE9<b>\xFF</b>\xC0</p>tail \xE9",
+            b"<p>0123456789abcdef\xE9 0123456789abcdef\xE9 0123456789abcdef</p>",
+            b"<p>\xE9\xE9\xE9\xE9\xE9\xE9\xE9\xE9\xE9\xE9\xE9\xE9\xE9\xE9\xE9\xE9</p>",
+        ];
+
+        /// `document` as one write, as one write per byte, and in between.
+        fn write_patterns(document: &[u8]) -> Vec<Vec<&[u8]>> {
+            [document.len().max(1), 1, 2, 3, 5]
+                .into_iter()
+                .map(|size| document.chunks(size).collect())
+                .collect()
+        }
+
+        type Chunks = Rc<RefCell<Vec<(String, bool)>>>;
+
+        /// A handler that records the chunks it is given and changes nothing.
+        fn observe(
+            chunks: &Chunks,
+            suspend: bool,
+        ) -> impl FnMut(&mut TextChunk<'_>) -> HandlerResult + use<> {
+            let chunks = Rc::clone(chunks);
+            move |t| {
+                chunks
+                    .borrow_mut()
+                    .push((t.as_str().to_owned(), t.last_in_text_node()));
+                if suspend { SUSPEND() } else { Ok(()) }
+            }
+        }
+
+        #[test]
+        fn a_handler_that_changes_nothing_keeps_the_bytes() {
+            for &document in DAMAGED {
+                for writes in write_patterns(document) {
+                    for suspend in [false, true] {
+                        let doc_chunks = Chunks::default();
+                        let element_chunks = Chunks::default();
+                        let (output, suspensions) = rewrite_writes(
+                            &writes,
+                            Settings {
+                                element_content_handlers: vec![on_text(
+                                    "*",
+                                    observe(&element_chunks, suspend),
+                                )],
+                                document_content_handlers: vec![doc_text!(observe(
+                                    &doc_chunks,
+                                    suspend
+                                ))],
+                                ..Settings::new()
+                            },
+                            |_| {},
+                        );
+
+                        assert_eq!(
+                            output, document,
+                            "{document:x?} written as {writes:x?}, suspend: {suspend}"
+                        );
+                        // The handlers still get the decoded text.
+                        let seen: String = doc_chunks.borrow().iter().map(|c| &*c.0).collect();
+                        assert!(seen.contains('\u{fffd}'), "{seen:?}");
+                        assert_eq!(suspend, suspensions != 0);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn handlers_get_the_decoded_text() {
+            let chunks_of = |document: &[u8]| {
+                let chunks = Chunks::default();
+                rewrite_writes(
+                    &[document],
+                    Settings {
+                        document_content_handlers: vec![doc_text!(observe(&chunks, false))],
+                        ..Settings::new()
+                    },
+                    |_| {},
+                );
+                chunks.take()
+            };
+
+            assert_eq!(
+                chunks_of(b"<p>a\xA9b</p>"),
+                [("a\u{fffd}b".to_owned(), false), (String::new(), true)]
+            );
+            // The bytes of a sequence that the end of the text node cuts short
+            // belong to the chunk that shows their U+FFFD, the last one.
+            assert_eq!(chunks_of(b"<p>\xE2</p>"), [("\u{fffd}".to_owned(), true)]);
+            assert_eq!(
+                chunks_of(b"<p>aa\xE2\x82</p>"),
+                [("aa".to_owned(), false), ("\u{fffd}".to_owned(), true)]
+            );
+        }
+
+        #[test]
+        fn content_around_the_chunk_keeps_the_bytes() {
+            for suspend in [false, true] {
+                let (output, _) = rewrite_writes(
+                    &[b"<p>caf\xE9!</p><p>th\xE9</p>"],
+                    Settings {
+                        document_content_handlers: vec![doc_text!(move |t| {
+                            if !t.as_str().is_empty() {
+                                t.before("<b>[", ContentType::Html);
+                                t.after("]</b>", ContentType::Html);
+                            }
+                            if suspend { SUSPEND() } else { Ok(()) }
+                        })],
+                        ..Settings::new()
+                    },
+                    |_| {},
+                );
+                // `th\xE9` is two chunks: 0xE9 could start a character, so its
+                // U+FFFD comes with the chunk that ends the text node.
+                assert_eq!(
+                    output,
+                    b"<p><b>[caf\xE9!]</b></p><p><b>[th]</b><b>[\xE9]</b></p>"
+                );
+            }
+        }
+
+        #[test]
+        fn a_replaced_or_removed_chunk_drops_the_bytes() {
+            let rewrite = |handler: fn(&mut TextChunk<'_>)| {
+                rewrite_writes(
+                    &[b"<p>caf\xE9!</p>"],
+                    Settings {
+                        document_content_handlers: vec![doc_text!(move |t| {
+                            handler(t);
+                            Ok(())
+                        })],
+                        ..Settings::new()
+                    },
+                    |_| {},
+                )
+                .0
+            };
+
+            assert_eq!(rewrite(|t| t.replace("X", ContentType::Text)), b"<p>XX</p>");
+            assert_eq!(rewrite(|t| t.remove()), b"<p></p>");
+            assert_eq!(
+                rewrite(|t| {
+                    t.before("[", ContentType::Text);
+                    t.remove();
+                    t.after("]", ContentType::Text);
+                }),
+                b"<p>[][]</p>"
+            );
+        }
+
+        #[test]
+        fn an_edited_chunk_is_written_as_edited() {
+            let rewrite = |handler: fn(&mut TextChunk<'_>)| {
+                rewrite_writes(
+                    &[b"<p>caf\xE9!</p>"],
+                    Settings {
+                        document_content_handlers: vec![doc_text!(move |t| {
+                            if !t.last_in_text_node() {
+                                handler(t);
+                            }
+                            Ok(())
+                        })],
+                        ..Settings::new()
+                    },
+                    |_| {},
+                )
+                .0
+            };
+
+            assert_eq!(
+                rewrite(|t| t.as_mut_str().push('?')),
+                "<p>caf\u{fffd}!?</p>".as_bytes()
+            );
+            assert_eq!(
+                rewrite(|t| t.set_str("tea".to_owned())),
+                "<p>tea</p>".as_bytes()
+            );
+            // Taking the text to edit it counts as an edit.
+            assert_eq!(
+                rewrite(|t| {
+                    let _ = t.as_mut_str();
+                }),
+                "<p>caf\u{fffd}!</p>".as_bytes()
+            );
+        }
+
+        #[test]
+        fn a_parked_chunk_keeps_the_bytes_until_it_is_changed() {
+            let rewrite = |on_suspend: fn(&mut TextChunk<'static>)| {
+                rewrite_writes(
+                    &[b"<p>caf\xE9!</p>"],
+                    Settings {
+                        document_content_handlers: vec![doc_text!(|t| {
+                            if t.last_in_text_node() {
+                                Ok(())
+                            } else {
+                                SUSPEND()
+                            }
+                        })],
+                        ..Settings::new()
+                    },
+                    |rewriter| on_suspend(rewriter.suspended_text_chunk().unwrap()),
+                )
+            };
+
+            assert_eq!(rewrite(|_| {}), (b"<p>caf\xE9!</p>".to_vec(), 1));
+            assert_eq!(
+                rewrite(|t| t.before("[", ContentType::Text)).0,
+                b"<p>[caf\xE9!</p>"
+            );
+            assert_eq!(
+                rewrite(|t| t.replace("tea", ContentType::Text)).0,
+                b"<p>tea</p>"
+            );
+            assert_eq!(
+                rewrite(|t| t.as_mut_str().push('?')).0,
+                "<p>caf\u{fffd}!?</p>".as_bytes()
+            );
+        }
+
+        #[test]
+        fn a_chunk_edited_before_it_is_parked_is_written_as_edited() {
+            let (output, suspensions) = rewrite_writes(
+                &[b"<p>caf\xE9!</p>"],
+                Settings {
+                    document_content_handlers: vec![doc_text!(|t| {
+                        if !t.last_in_text_node() {
+                            t.as_mut_str().push('?');
+                        }
+                        SUSPEND()
+                    })],
+                    ..Settings::new()
+                },
+                |_| {},
+            );
+            assert_eq!(output, "<p>caf\u{fffd}!?</p>".as_bytes());
+            assert_eq!(suspensions, 2);
+        }
+
+        #[test]
+        fn a_chunk_parked_twice_keeps_the_bytes() {
+            let (output, suspensions) = rewrite_writes(
+                &[b"<p>caf\xE9!</p><p>th\xE9</p>"],
+                Settings {
+                    document_content_handlers: vec![
+                        doc_text!(|_| SUSPEND()),
+                        doc_text!(|_| SUSPEND()),
+                    ],
+                    ..Settings::new()
+                },
+                |_| {},
+            );
+            assert_eq!(output, b"<p>caf\xE9!</p><p>th\xE9</p>");
+            assert_eq!(suspensions, 8);
+        }
+
+        #[test]
+        fn bytes_of_a_chunk_that_is_not_written_do_not_reach_a_later_chunk() {
+            // The text of the removed element is parked with its source bytes.
+            let (output, suspensions) = rewrite_writes(
+                &[b"<div>caf\xE9!</div><p>tea</p>"],
+                Settings {
+                    element_content_handlers: vec![element!("div", |el| {
+                        el.remove();
+                        Ok(())
+                    })],
+                    document_content_handlers: vec![doc_text!(|_| SUSPEND())],
+                    ..Settings::new()
+                },
+                |_| {},
+            );
+            assert_eq!(output, b"<p>tea</p>");
+            assert_eq!(suspensions, 4);
+        }
+
+        #[test]
+        fn a_later_handler_can_change_a_chunk_after_a_suspension() {
+            let (output, suspensions) = rewrite_writes(
+                &[b"<p>caf\xE9!</p><p>th\xE9!</p>"],
+                Settings {
+                    document_content_handlers: vec![
+                        doc_text!(|_| SUSPEND()),
+                        doc_text!(|t| {
+                            if t.as_str().starts_with("th") {
+                                t.replace("tea", ContentType::Text);
+                            }
+                            Ok(())
+                        }),
+                    ],
+                    ..Settings::new()
+                },
+                |_| {},
+            );
+            assert_eq!(output, b"<p>caf\xE9!</p><p>tea</p>");
+            assert_eq!(suspensions, 4);
+        }
+
+        #[test]
+        fn bytes_stay_with_the_chunk_that_shows_their_character() {
+            // U+1F600 and U+20AC split by a write. Whichever chunk a handler
+            // replaces, no part of a character is left behind or lost.
+            let split_in_well_formed_text: &[&[u8]] = &[b"<p>a\xF0\x9F", b"\x98\x80b</p>"];
+            let split_after_damage: &[&[u8]] = &[b"<p>caf\xE9\xE2", b"\x82\xACb</p>"];
+
+            let rewrite = |writes: &[&[u8]], replaced: &'static str, suspend: bool| {
+                rewrite_writes(
+                    writes,
+                    Settings {
+                        element_content_handlers: vec![on_text("p", move |t| {
+                            if !replaced.is_empty() && t.as_str().contains(replaced) {
+                                t.replace("X", ContentType::Text);
+                            }
+                            if suspend { SUSPEND() } else { Ok(()) }
+                        })],
+                        ..Settings::new()
+                    },
+                    |_| {},
+                )
+                .0
+            };
+
+            for suspend in [false, true] {
+                assert_eq!(
+                    rewrite(split_in_well_formed_text, "", suspend),
+                    "<p>a\u{1F600}b</p>".as_bytes()
+                );
+                assert_eq!(
+                    rewrite(split_in_well_formed_text, "\u{1F600}", suspend),
+                    b"<p>aX</p>"
+                );
+                assert_eq!(
+                    rewrite(split_in_well_formed_text, "a", suspend),
+                    "<p>X\u{1F600}b</p>".as_bytes()
+                );
+
+                assert_eq!(
+                    rewrite(split_after_damage, "", suspend),
+                    b"<p>caf\xE9\xE2\x82\xACb</p>"
+                );
+                assert_eq!(
+                    rewrite(split_after_damage, "\u{20ac}", suspend),
+                    b"<p>caf\xE9X</p>"
+                );
+                assert_eq!(
+                    rewrite(split_after_damage, "caf", suspend),
+                    "<p>X\u{20ac}b</p>".as_bytes()
+                );
+            }
+        }
+
+        #[test]
+        fn a_write_that_only_continues_a_character_makes_no_chunk() {
+            let chunks = Chunks::default();
+            let mut observe = observe(&chunks, false);
+            let (output, _) = rewrite_writes(
+                &[b"<p>a", b"\xE2\x82", b"\xACb</p>"],
+                Settings {
+                    element_content_handlers: vec![on_text("p", move |t| {
+                        t.before("|", ContentType::Text);
+                        observe(t)
+                    })],
+                    ..Settings::new()
+                },
+                |_| {},
+            );
+            assert_eq!(output, "<p>|a|\u{20ac}b|</p>".as_bytes());
+            assert_eq!(
+                *chunks.borrow(),
+                [
+                    ("a".to_owned(), false),
+                    ("\u{20ac}b".to_owned(), false),
+                    (String::new(), true)
+                ]
+            );
+        }
+
+        #[test]
+        fn content_after_the_last_chunk_follows_the_bytes() {
+            // `last_flush_text_decoder`, byte for byte.
+            let (output, _) = rewrite_writes(
+                &[b"<p>\xF0\xF0\x9F\xF0\x9F\x98</p>"],
+                Settings {
+                    document_content_handlers: vec![doc_text!(|t| {
+                        if t.last_in_text_node() {
+                            t.after(" last", ContentType::Text);
+                        }
+                        Ok(())
+                    })],
+                    ..Settings::new()
+                },
+                |_| {},
+            );
+            assert_eq!(output, b"<p>\xF0\xF0\x9F\xF0\x9F\x98 last</p>");
+        }
+
+        #[test]
+        fn a_document_in_another_encoding_is_written_as_before() {
+            use crate::AsciiCompatibleEncoding;
+            use encoding_rs::WINDOWS_1252;
+
+            // Shift_JIS cannot decode 0xFF: the chunk has a U+FFFD, and what is
+            // written is that character as Shift_JIS can express it.
+            let (output, _) = rewrite_writes(
+                &[b"<p>a\xFFb \x93\xFA</p>"],
+                Settings {
+                    document_content_handlers: vec![doc_text!(|_| Ok(()))],
+                    encoding: AsciiCompatibleEncoding::new(encoding_rs::SHIFT_JIS).unwrap(),
+                    ..Settings::new()
+                },
+                |_| {},
+            );
+            assert_eq!(output, b"<p>a&#65533;b \x93\xFA</p>");
+
+            // Every byte is a character in windows-1252.
+            let (output, _) = rewrite_writes(
+                &[b"<p>caf\xE9 \x81</p>"],
+                Settings {
+                    document_content_handlers: vec![doc_text!(|_| Ok(()))],
+                    encoding: AsciiCompatibleEncoding::new(WINDOWS_1252).unwrap(),
+                    ..Settings::new()
+                },
+                |_| {},
+            );
+            assert_eq!(output, b"<p>caf\xE9 \x81</p>");
+        }
+
+        /// Text nodes of every kind, with tags, comments and nothing between them.
+        fn random_document(rng: &mut Rng, damage: bool) -> Vec<u8> {
+            let mut document = vec![];
+            for _ in 0..1 + rng.below(5) {
+                let (open, close): (&[u8], &[u8]) = match rng.below(9) {
+                    0 => (b"<script>", b"</script>"),
+                    1 => (b"<title>", b"</title>"),
+                    2 => (b"<style>", b"</style>"),
+                    3 => (b"<div><!--c-->", b"</div>"),
+                    4 => (b"<div>", b"<b>x</b></div>"),
+                    5 => (b"", b""),
+                    _ => (b"<p>", b"</p>"),
+                };
+                document.extend_from_slice(open);
+                let len = match rng.below(6) {
+                    0 => 0,
+                    1 => 1 + rng.below(4),
+                    2 => 30 + rng.below(60),
+                    _ => 5 + rng.below(25),
+                };
+                random_text(rng, len as usize, damage, &mut document);
+                document.extend_from_slice(close);
+            }
+            document
+        }
+
+        #[test]
+        fn handlers_that_change_nothing_never_change_the_output() {
+            // LOL_HTML_FUZZ_DOCUMENTS=200000 for a longer run.
+            let documents = std::env::var("LOL_HTML_FUZZ_DOCUMENTS")
+                .ok()
+                .map_or(1_500, |n| n.parse::<u64>().unwrap());
+            let mut lossy_documents = 0;
+            let mut total_suspensions = 0;
+
+            for seed in 1..=documents {
+                let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+                let damage = seed % 4 != 0;
+                let document = random_document(&mut rng, damage);
+                let cuts = random_cuts(&mut rng, document.len());
+                let mut writes = vec![];
+                let mut start = 0;
+                for &end in &cuts {
+                    writes.push(&document[start..end]);
+                    start = end;
+                }
+                lossy_documents += u64::from(std::str::from_utf8(&document).is_err());
+
+                // 0: one handler; 1: two handlers that suspend at random.
+                for mode in 0..2 {
+                    let suspend_rng = Rc::new(RefCell::new(Rng(seed | 1)));
+                    let handler = |suspend_rng: &Rc<RefCell<Rng>>| {
+                        let suspend_rng = Rc::clone(suspend_rng);
+                        move |_: &mut TextChunk<'_>| {
+                            if mode == 1 && suspend_rng.borrow_mut().below(3) == 0 {
+                                SUSPEND()
+                            } else {
+                                Ok(())
+                            }
+                        }
+                    };
+                    let mut settings = Settings {
+                        document_content_handlers: vec![doc_text!(handler(&suspend_rng))],
+                        ..Settings::new()
+                    };
+                    if mode == 1 {
+                        settings
+                            .element_content_handlers
+                            .push(on_text("*", handler(&suspend_rng)));
+                    }
+
+                    let (output, suspensions) = rewrite_writes(&writes, settings, |_| {});
+                    assert_eq!(
+                        output, document,
+                        "seed {seed}, mode {mode}: {document:x?} cut at {cuts:?}"
+                    );
+                    total_suspensions += suspensions;
+                }
+            }
+
+            // The documents do reach the paths this test is about.
+            assert!(lossy_documents > documents / 2, "{lossy_documents}");
+            assert!(total_suspensions > 0);
+        }
+
+        #[cfg(target_pointer_width = "64")]
+        #[test]
+        fn a_chunk_is_no_larger_for_it() {
+            assert_eq!(size_of::<TextChunk<'_>>(), 80);
         }
     }
 }

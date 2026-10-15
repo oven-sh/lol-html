@@ -6,9 +6,9 @@ use crate::parser::{
     ActionError, ActionResult, AttributeBuffer, Lexeme, LexemeSink, NonTagContentLexeme,
     ParserDirective, ParserOutputSink, TagHintSink, TagLexeme, TagTokenOutline,
 };
-use crate::rewritable_units::TextDecoder;
 use crate::rewritable_units::ToTokenResult;
 use crate::rewritable_units::{BailOut, DocumentEnd, Serialize, ToToken, Token, TokenCaptureFlags};
+use crate::rewritable_units::{TextDecoder, TextSink};
 use crate::rewriter::RewritingError;
 use encoding_rs::Encoding;
 
@@ -248,9 +248,87 @@ where
         Ok(())
     }
 
+    /// [`Self::text_token_produced`] for a chunk whose text is a lossy decoding of
+    /// `source`: unless a handler replaces, removes or edits it, the chunk is written
+    /// back from `source`.
+    #[cold]
+    #[inline(never)]
+    fn lossy_text_token_produced(
+        &mut self,
+        text: &str,
+        source: [&[u8]; 2],
+        encoding: &'static Encoding,
+        text_type: TextType,
+        is_last_in_node: bool,
+        source_location: SourceLocation,
+    ) -> Result<(), RewritingError> {
+        let mut token = Token::TextChunk(TextChunk::new(
+            text,
+            text_type,
+            is_last_in_node,
+            encoding,
+            source_location,
+        ));
+
+        trace!(@output token);
+
+        self.transform_controller.handle_token(&mut token)?;
+
+        if self.emission_enabled {
+            let output_handler = &mut |c: &[u8]| self.output_sink.handle_chunk(c);
+            match token {
+                Token::TextChunk(chunk) => chunk.into_bytes_from_source(source, output_handler)?,
+                token => token.into_bytes(output_handler)?,
+            }
+        }
+        Ok(())
+    }
+
     #[inline]
     fn should_stop_removing_element_content(&self) -> bool {
         !self.emission_enabled && self.transform_controller.should_emit_content()
+    }
+}
+
+/// Hands the chunks of a decoded text lexeme to the transform controller.
+struct TextTokenSink<'d, C, O> {
+    delegate: &'d mut DispatcherDelegate<C, O>,
+    text_type: TextType,
+}
+
+impl<C, O> TextSink for TextTokenSink<'_, C, O>
+where
+    C: TransformController,
+    O: OutputSink,
+{
+    #[inline]
+    fn text(
+        &mut self,
+        text: &str,
+        is_last: bool,
+        encoding: &'static Encoding,
+        source_location: SourceLocation,
+    ) -> Result<(), RewritingError> {
+        self.delegate
+            .text_token_produced(text, encoding, self.text_type, is_last, source_location)
+    }
+
+    fn lossy_text(
+        &mut self,
+        text: &str,
+        source: [&[u8]; 2],
+        is_last: bool,
+        encoding: &'static Encoding,
+        source_location: SourceLocation,
+    ) -> Result<(), RewritingError> {
+        self.delegate.lossy_text_token_produced(
+            text,
+            source,
+            encoding,
+            self.text_type,
+            is_last,
+            source_location,
+        )
     }
 }
 
@@ -324,14 +402,9 @@ where
                 let res = self.text_decoder.feed_text(
                     lexeme.spanned(),
                     false,
-                    &mut |text, is_last, encoding, source_location| {
-                        self.delegate.text_token_produced(
-                            text,
-                            encoding,
-                            self.last_text_type,
-                            is_last,
-                            source_location,
-                        )
+                    &mut TextTokenSink {
+                        delegate: &mut self.delegate,
+                        text_type,
                     },
                 );
                 if let Err(e) = res {
@@ -451,16 +524,10 @@ where
     /// Emit text chunk with is_last_in_node
     #[inline]
     fn flush_pending_captured_text(&mut self) -> Result<(), RewritingError> {
-        self.text_decoder
-            .flush_pending(&mut |text, is_last, encoding, source_location| {
-                self.delegate.text_token_produced(
-                    text,
-                    encoding,
-                    self.last_text_type,
-                    is_last,
-                    source_location,
-                )
-            })
+        self.text_decoder.flush_pending(&mut TextTokenSink {
+            delegate: &mut self.delegate,
+            text_type: self.last_text_type,
+        })
     }
 
     pub fn flush_remaining_input(&mut self, input: &[u8], consumed_byte_count: usize) {
@@ -538,8 +605,15 @@ where
 
         // 2. The serialization step `token_produced`/`text_token_produced`
         //    never reached.
+        let lossy_source = self.text_decoder.take_parked_lossy_source();
         if self.delegate.emission_enabled {
-            token.into_bytes(&mut |c| self.delegate.output_sink.handle_chunk(c))?;
+            let output_handler = &mut |c: &[u8]| self.delegate.output_sink.handle_chunk(c);
+            match (token, lossy_source) {
+                (Token::TextChunk(chunk), Some(source)) => {
+                    chunk.into_bytes_from_source([&source, &[]], output_handler)?;
+                }
+                (token, _) => token.into_bytes(output_handler)?,
+            }
         }
 
         // The resumed handler for <meta charset> may have changed encoding.
@@ -552,14 +626,9 @@ where
         while let Some(feed) = self.text_decoder.take_suspended() {
             self.text_decoder.resume_feed(
                 feed,
-                &mut |text, is_last, encoding, source_location| {
-                    self.delegate.text_token_produced(
-                        text,
-                        encoding,
-                        self.last_text_type,
-                        is_last,
-                        source_location,
-                    )
+                &mut TextTokenSink {
+                    delegate: &mut self.delegate,
+                    text_type: self.last_text_type,
                 },
             )?;
         }
