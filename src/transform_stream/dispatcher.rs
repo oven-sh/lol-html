@@ -244,9 +244,12 @@ where
 
         if self.emission_enabled {
             let output_handler = &mut |c: &[u8]| self.output_sink.handle_chunk(c);
-            match token {
-                Token::TextChunk(chunk) => chunk.into_bytes_from_source(source, output_handler)?,
-                token => token.into_bytes(output_handler)?,
+            let written = match &mut token {
+                Token::TextChunk(chunk) => chunk.write_from_source(source, output_handler)?,
+                _ => false,
+            };
+            if !written {
+                token.into_bytes(output_handler)?;
             }
         }
         Ok(())
@@ -488,7 +491,7 @@ where
             .expect("resume_dispatch called without a pending suspension");
 
         // 1. The handlers that had not yet run for the parked token.
-        let token = self
+        let mut token = self
             .delegate
             .transform_controller
             .resume_suspended_token()?;
@@ -498,11 +501,14 @@ where
         let lossy_source = self.text_decoder.take_parked_lossy_source();
         if self.delegate.emission_enabled {
             let output_handler = &mut |c: &[u8]| self.delegate.output_sink.handle_chunk(c);
-            match (token, lossy_source) {
+            let written = match (&mut token, &lossy_source) {
                 (Token::TextChunk(chunk), Some(source)) => {
-                    chunk.into_bytes_from_source([&source, &[]], output_handler)?;
+                    chunk.write_from_source([source, &[]], output_handler)?
                 }
-                (token, _) => token.into_bytes(output_handler)?,
+                _ => false,
+            };
+            if !written {
+                token.into_bytes(output_handler)?;
             }
         }
 
