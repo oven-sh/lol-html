@@ -442,8 +442,11 @@ fn emit_lossy(
 
 /// Moves the source-byte bookkeeping past one `decode_to_str` call that
 /// consumed `consumed` (UTF-8 only). `may_hold` says whether the decoder can
-/// have kept an incomplete sequence: it does so only when it ran out of input
-/// and more input may follow.
+/// have kept an incomplete sequence. The UTF-8 decoder of encoding_rs keeps
+/// one only when it ran out of input and more input may follow: when it stops
+/// because the output buffer is full, it has consumed whole sequences only.
+/// That is how the decoder behaves, not something its API promises:
+/// `chunks_account_for_every_source_byte` checks it, with a 13-byte buffer.
 ///
 /// Returns the source bytes of the text that call wrote, when the text is not
 /// a faithful copy of them: the sequence held from earlier calls, then the

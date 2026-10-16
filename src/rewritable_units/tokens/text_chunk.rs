@@ -364,9 +364,11 @@ impl<'i> TextChunk<'i> {
         Ok(())
     }
 
-    /// Serializes a chunk whose text is a lossy decoding of `source` (malformed input
-    /// shows in it as U+FFFD): the chunk is written back from `source`, unless a handler
-    /// replaced, removed or edited it.
+    /// Writes a chunk whose text is a lossy decoding of `source` (malformed input
+    /// shows in it as U+FFFD): `source` goes out in place of the text, unless a
+    /// handler replaced or removed the chunk. Returns `false`, with nothing written,
+    /// if a handler edited the text: the caller then serializes the chunk from its
+    /// text, like any other token.
     ///
     /// Upstream lol-html writes the decoded text back here, and so does Cloudflare
     /// Workers: malformed input leaves as U+FFFD even when no handler touched the
@@ -374,14 +376,23 @@ impl<'i> TextChunk<'i> {
     /// observes a chunk must not change the document.
     ///
     /// The content around the chunk follows the same order as `impl_serialize!`.
+    ///
+    /// The shape of this function keeps well-formed documents as fast as they were.
+    /// It borrows the chunk, so `Token::into_bytes` stays the only consumer of one.
+    /// It is `#[inline]` so that it is compiled with its callers and not into this
+    /// crate: there it would bring the drop glue of the mutations with it, a crate
+    /// built with `-Zshare-generics` (Bun) would link to that copy, and the drop of a
+    /// chunk would no longer be inlined into `Token::into_bytes`. Either way costs
+    /// about 20 instructions for every chunk of every document.
     #[cold]
-    pub(crate) fn into_bytes_from_source(
-        mut self,
+    #[inline]
+    pub(crate) fn write_from_source(
+        &mut self,
         source: [&[u8]; 2],
         output_handler: &mut dyn FnMut(&[u8]),
-    ) -> Result<(), RewritingError> {
+    ) -> Result<bool, RewritingError> {
         if self.text_edited {
-            return crate::rewritable_units::Serialize::into_bytes(self, output_handler);
+            return Ok(false);
         }
         let write_source = |output_handler: &mut dyn FnMut(&[u8])| {
             for part in source {
@@ -391,10 +402,7 @@ impl<'i> TextChunk<'i> {
             }
         };
         match self.mutations.take() {
-            None => {
-                write_source(output_handler);
-                Ok(())
-            }
+            None => write_source(output_handler),
             Some(mutations) => {
                 let mut sink = StreamingHandlerSink::new(self.encoding, output_handler);
                 mutations
@@ -412,9 +420,10 @@ impl<'i> TextChunk<'i> {
                 mutations
                     .content_after
                     .encode(&mut sink)
-                    .map_err(RewritingError::ContentHandlerError)
+                    .map_err(RewritingError::ContentHandlerError)?;
             }
         }
+        Ok(true)
     }
 
     /// Position of this text fragment in the source document, before any rewriting
@@ -630,8 +639,8 @@ mod tests {
     /// edited, replaced or removed: the bytes it was decoded from.
     mod source_bytes {
         use super::*;
-        use crate::errors::SuspensionRequest;
-        use crate::{ElementContentHandlers, HandlerResult, Selector, Settings};
+        use crate::errors::{RewritingError, SuspensionRequest};
+        use crate::{ElementContentHandlers, HandlerResult, HtmlRewriter, Selector, Settings};
         use std::borrow::Cow;
         use std::cell::RefCell;
         use std::rc::Rc;
@@ -1066,6 +1075,118 @@ mod tests {
         }
 
         #[test]
+        fn content_around_a_lossy_chunk_is_ordered_as_around_any_chunk() {
+            // Every way to put content around a chunk, to replace it and to remove it.
+            let scripts: [fn(&mut TextChunk<'_>); 6] = [
+                |_| {},
+                |t| {
+                    t.before("<1>", ContentType::Html);
+                    t.before("<2>", ContentType::Text);
+                    t.after("<3>", ContentType::Html);
+                    t.after("<4>", ContentType::Text);
+                },
+                |t| {
+                    t.after("<1>", ContentType::Html);
+                    t.replace("<2>", ContentType::Html);
+                    t.replace("<3>", ContentType::Text);
+                    t.before("<4>", ContentType::Html);
+                },
+                |t| {
+                    t.before("<1>", ContentType::Html);
+                    t.remove();
+                    t.after("<2>", ContentType::Html);
+                },
+                |t| {
+                    t.streaming_before(streaming!(|s| {
+                        s.write_str("<1>", ContentType::Html);
+                        Ok(())
+                    }));
+                    t.before("<2>", ContentType::Html);
+                    t.streaming_after(streaming!(|s| {
+                        s.write_str("<3>", ContentType::Text);
+                        Ok(())
+                    }));
+                    t.after("<4>", ContentType::Html);
+                },
+                |t| {
+                    t.before("<1>", ContentType::Html);
+                    t.streaming_replace(streaming!(|s| {
+                        s.write_str("<2>", ContentType::Html);
+                        Ok(())
+                    }));
+                    t.after("<3>", ContentType::Html);
+                },
+            ];
+
+            for (n, script) in scripts.into_iter().enumerate() {
+                for suspend in [false, true] {
+                    let rewrite = |document: &[u8]| {
+                        rewrite_writes(
+                            &[document],
+                            Settings {
+                                document_content_handlers: vec![doc_text!(move |t| {
+                                    if !t.as_str().is_empty() {
+                                        script(t);
+                                    }
+                                    if suspend { SUSPEND() } else { Ok(()) }
+                                })],
+                                ..Settings::new()
+                            },
+                            |_| {},
+                        )
+                        .0
+                    };
+
+                    // The same document with well-formed text: its chunk is
+                    // written by `impl_serialize!`.
+                    let twin = rewrite(b"<p>caf@!</p>");
+                    let expected = match twin.windows(5).position(|w| w == b"caf@!") {
+                        Some(at) => [&twin[..at], b"caf\xE9!", &twin[at + 5..]].concat(),
+                        None => twin,
+                    };
+                    assert_eq!(
+                        rewrite(b"<p>caf\xE9!</p>"),
+                        expected,
+                        "script {n}, suspend: {suspend}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn an_error_from_content_around_a_lossy_chunk_fails_the_rewrite() {
+            let scripts: [fn(&mut TextChunk<'_>); 3] = [
+                |t| t.streaming_before(streaming!(|_| Err("no content".into()))),
+                |t| t.streaming_replace(streaming!(|_| Err("no content".into()))),
+                |t| t.streaming_after(streaming!(|_| Err("no content".into()))),
+            ];
+
+            for (n, script) in scripts.into_iter().enumerate() {
+                // A lossy chunk, and a well-formed one for comparison.
+                for document in [&b"<p>caf\xE9!</p>"[..], b"<p>caf@!</p>"] {
+                    let mut rewriter = HtmlRewriter::new(
+                        Settings {
+                            document_content_handlers: vec![doc_text!(move |t| {
+                                // Not the empty chunk that ends the text node.
+                                if !t.as_str().is_empty() {
+                                    script(t);
+                                }
+                                Ok(())
+                            })],
+                            ..Settings::new()
+                        },
+                        |_: &[u8]| {},
+                    );
+                    let res = rewriter.write(document);
+                    assert!(
+                        matches!(res, Err(RewritingError::ContentHandlerError(_))),
+                        "script {n}, {document:x?}: {res:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
         fn a_document_in_another_encoding_is_written_as_before() {
             use crate::AsciiCompatibleEncoding;
             use encoding_rs::WINDOWS_1252;
@@ -1179,6 +1300,116 @@ mod tests {
             // The documents do reach the paths this test is about.
             assert!(lossy_documents > documents / 2, "{lossy_documents}");
             assert!(total_suspensions > 0);
+        }
+
+        /// Handlers that change elements and remove every comment.
+        fn other_handlers<'h>(element_change: u64) -> Settings<'h, 'static> {
+            Settings {
+                element_content_handlers: vec![element!("div, b, p", move |el| {
+                    match element_change {
+                        0 => el.remove_and_keep_content(),
+                        1 => el.remove(),
+                        2 => {
+                            el.before("<i>", ContentType::Html);
+                            el.after("</i>", ContentType::Html);
+                        }
+                        3 => {
+                            el.prepend("[", ContentType::Text);
+                            el.append("]", ContentType::Text);
+                        }
+                        4 => el.set_inner_content("x", ContentType::Text),
+                        _ => el.replace("<hr>", ContentType::Html),
+                    }
+                    Ok(())
+                })],
+                document_content_handlers: vec![doc_comments!(|c| {
+                    c.remove();
+                    Ok(())
+                })],
+                ..Settings::new()
+            }
+        }
+
+        /// `other_handlers`, and text handlers that change nothing.
+        fn other_handlers_and_text<'h>(
+            element_change: u64,
+            chunks: &Chunks,
+            suspend: bool,
+        ) -> Settings<'h, 'static> {
+            let mut settings = other_handlers(element_change);
+            settings
+                .element_content_handlers
+                .push(on_text("*", observe(&Chunks::default(), suspend)));
+            settings
+                .document_content_handlers
+                .push(doc_text!(observe(chunks, suspend)));
+            settings
+        }
+
+        #[test]
+        fn bytes_that_a_removed_token_separated_are_written_side_by_side() {
+            // The tags and the comment go, and the bytes around them make a
+            // U+20AC that no text handler was given. The output is the same
+            // without a text handler.
+            for document in [
+                &b"<p>\xE2<b>\x82</b>\xAC</p>"[..],
+                b"<p>\xE2<!--c-->\x82\xAC</p>",
+            ] {
+                let (without_text_handlers, _) =
+                    rewrite_writes(&[document], other_handlers(0), |_| {});
+                assert_eq!(without_text_handlers, "\u{20ac}".as_bytes());
+
+                for suspend in [false, true] {
+                    let chunks = Chunks::default();
+                    let (output, _) = rewrite_writes(
+                        &[document],
+                        other_handlers_and_text(0, &chunks, suspend),
+                        |_| {},
+                    );
+                    assert_eq!(output, without_text_handlers);
+                    let seen: String = chunks.borrow().iter().map(|c| &*c.0).collect();
+                    assert!(seen.chars().all(|c| c == '\u{fffd}'), "{seen:?}");
+                }
+            }
+        }
+
+        #[test]
+        fn handlers_that_change_nothing_change_no_byte_whatever_other_handlers_do() {
+            let mut changed_documents = 0;
+
+            for seed in 1..=400u64 {
+                let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+                let document = random_document(&mut rng, true);
+                let cuts = random_cuts(&mut rng, document.len());
+                let mut writes = vec![];
+                let mut start = 0;
+                for &end in &cuts {
+                    writes.push(&document[start..end]);
+                    start = end;
+                }
+
+                for element_change in 0..6 {
+                    let (without_text_handlers, _) =
+                        rewrite_writes(&writes, other_handlers(element_change), |_| {});
+                    changed_documents += u64::from(without_text_handlers != document);
+
+                    for suspend in [false, true] {
+                        let (output, _) = rewrite_writes(
+                            &writes,
+                            other_handlers_and_text(element_change, &Chunks::default(), suspend),
+                            |_| {},
+                        );
+                        assert_eq!(
+                            output, without_text_handlers,
+                            "seed {seed}, element change {element_change}, suspend: {suspend}: \
+                             {document:x?} cut at {cuts:?}"
+                        );
+                    }
+                }
+            }
+
+            // The other handlers do change the documents.
+            assert!(changed_documents > 1_000, "{changed_documents}");
         }
 
         #[cfg(target_pointer_width = "64")]
