@@ -1002,8 +1002,11 @@ mod tests {
                     Ok(())
                 })),
         );
+        // The text handler gets U+FFFD for the 0xC3 that the tag cuts short.
+        // Upstream writes that U+FFFD ("ï¿½" here). This fork writes a chunk
+        // that no handler changed with the bytes it had in the input.
         assert_eq!(
-            "<head>ï¿½<meta charset=latin1>°</head>",
+            "<head>Ã<meta charset=latin1>°</head>",
             rewritten.iter().map(|&c| char::from(c)).collect::<String>()
         );
     }
