@@ -2097,8 +2097,19 @@ mod tests {
         fn drive<'h>(
             chunks: &[&str],
             settings: Settings<'h, '_>,
-            mut on_suspend: impl FnMut(&mut HtmlRewriter<'h, TestSink>),
+            on_suspend: impl FnMut(&mut HtmlRewriter<'h, TestSink>),
         ) -> (String, usize) {
+            let chunks: Vec<&[u8]> = chunks.iter().map(|chunk| chunk.as_bytes()).collect();
+            let (out, suspensions) = drive_bytes(&chunks, settings, on_suspend);
+            (String::from_utf8(out).unwrap(), suspensions)
+        }
+
+        /// [`drive`] for input and output that may not be UTF-8.
+        fn drive_bytes<'h>(
+            chunks: &[&[u8]],
+            settings: Settings<'h, '_>,
+            mut on_suspend: impl FnMut(&mut HtmlRewriter<'h, TestSink>),
+        ) -> (Vec<u8>, usize) {
             let out = Rc::new(RefCell::new(Vec::<u8>::new()));
             let out_in_sink = Rc::clone(&out);
             let sink: TestSink = Box::new(move |c: &[u8]| {
@@ -2125,7 +2136,7 @@ mod tests {
             };
 
             for chunk in chunks {
-                let res = rewriter.write(chunk.as_bytes());
+                let res = rewriter.write(chunk);
                 pump(&mut rewriter, res);
             }
             let res = rewriter.end_mut();
@@ -2135,7 +2146,7 @@ mod tests {
             drop(rewriter);
 
             let out = Rc::try_unwrap(out).unwrap().into_inner();
-            (String::from_utf8(out).unwrap(), suspensions)
+            (out, suspensions)
         }
 
         const SUSPEND: fn() -> HandlerResult = || Err(SuspensionRequest.into());
@@ -2710,6 +2721,129 @@ mod tests {
             assert_eq!(*order.borrow(), ["text-last", "comment"]);
             assert_eq!(out, "hello<!-- unterminated");
             assert_eq!(n, 1);
+        }
+
+        /// What a text handler saw of one chunk: the text,
+        /// `last_in_text_node` and the source range.
+        type SeenChunk = (String, bool, std::ops::Range<usize>);
+
+        /// Rewrites `writes` with two text handlers on `p`. The first
+        /// suspends on every `every`th chunk (on none for 0). With `others`,
+        /// the second suspends on every chunk, and an element handler
+        /// suspends on `<p>`, so that the parser reads the text from its own
+        /// buffer. Returns the output, what each text handler saw and the
+        /// suspension count.
+        fn drive_text(
+            writes: &[&[u8]],
+            every: usize,
+            others: bool,
+        ) -> (Vec<u8>, [Vec<SeenChunk>; 2], usize) {
+            let input_len: usize = writes.iter().map(|write| write.len()).sum();
+            let seen = Rc::new(RefCell::new([Vec::new(), Vec::new()]));
+            let (seen1, seen2) = (Rc::clone(&seen), Rc::clone(&seen));
+            let record = move |seen: &mut Vec<SeenChunk>, t: &TextChunk<'_>| {
+                assert!(seen.len() <= input_len, "the text does not advance");
+                let text = t.as_str().to_owned();
+                seen.push((text, t.last_in_text_node(), t.source_location().bytes()));
+                seen.len()
+            };
+            let on_p = |handlers| (Cow::Owned("p".parse().unwrap()), handlers);
+
+            let (out, suspensions) = drive_bytes(
+                writes,
+                Settings {
+                    element_content_handlers: vec![
+                        element!("p", move |_| if others { SUSPEND() } else { Ok(()) }),
+                        on_p(ElementContentHandlers::default().text(
+                            move |t: &mut TextChunk<'_>| {
+                                let chunks = record(&mut seen1.borrow_mut()[0], t);
+                                if every != 0 && chunks % every == 0 {
+                                    SUSPEND()
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                        )),
+                        on_p(ElementContentHandlers::default().text(
+                            move |t: &mut TextChunk<'_>| {
+                                record(&mut seen2.borrow_mut()[1], t);
+                                if others { SUSPEND() } else { Ok(()) }
+                            },
+                        )),
+                    ],
+                    ..Settings::new()
+                },
+                |_| {},
+            );
+
+            let seen = Rc::try_unwrap(seen).unwrap().into_inner();
+            (out, seen, suspensions)
+        }
+
+        #[test]
+        fn text_suspension_in_the_middle_of_a_lexeme() {
+            // A text lexeme that takes the streaming decoder comes out as
+            // several chunks (13 bytes each in tests). It does so after a
+            // byte that is not UTF-8, and when it is not the first lexeme of
+            // its text node. A handler that suspends on one of the chunks
+            // parks the rest of the lexeme.
+
+            // The period of `text` is not a multiple of the chunk length, so
+            // each chunk has its own text.
+            let text: Vec<u8> = b"abcdefghijklmnopqrstuvwxyz0123456789_"
+                .iter()
+                .copied()
+                .cycle()
+                .take(100)
+                .collect();
+            let wide = "\u{20AC}\u{2192}\u{221A}\u{2603}\u{2764}\u{2600}\u{266B}".repeat(4);
+            let documents: [(&str, Vec<Vec<u8>>); 6] = [
+                (
+                    "a byte that is not UTF-8 comes first",
+                    vec![[b"<p>\xE9", &text[..], b"</p>tail"].concat()],
+                ),
+                (
+                    "the fast path takes a valid prefix first",
+                    vec![[b"<p>", &text[..30], b"\xE9", &text[..], b"</p>"].concat()],
+                ),
+                (
+                    "a `<` that does not open a tag ends the first lexeme",
+                    vec![[b"<p>a < ", &text[..], b"</p>"].concat()],
+                ),
+                (
+                    "characters of 3 bytes",
+                    vec![[b"<p>\xE9", wide.as_bytes(), b"</p>"].concat()],
+                ),
+                (
+                    "the text node continues in later writes",
+                    vec![
+                        [b"<p>", &text[..]].concat(),
+                        [&text[..], b"\xE2\x82"].concat(),
+                        [b"\xAC", &text[..], b"</p>"].concat(),
+                    ],
+                ),
+                (
+                    "the text node ends in `end()`",
+                    vec![[b"<p>\xE9", &text[..], b"<"].concat()],
+                ),
+            ];
+
+            for (name, writes) in &documents {
+                let writes: Vec<&[u8]> = writes.iter().map(Vec::as_slice).collect();
+                let (expected_out, expected_seen, _) = drive_text(&writes, 0, false);
+                assert!(expected_seen[0].len() > 8, "{name}");
+                assert_eq!(expected_seen[0], expected_seen[1], "{name}");
+
+                for others in [false, true] {
+                    for every in [1, 2, 3, 7] {
+                        let (out, seen, suspensions) = drive_text(&writes, every, others);
+                        let case = format!("{name}, every: {every}, others: {others}");
+                        assert_eq!(seen, expected_seen, "{case}");
+                        assert_eq!(out, expected_out, "{case}");
+                        assert!(suspensions >= expected_seen[0].len() / every, "{case}");
+                    }
+                }
+            }
         }
     }
 }
